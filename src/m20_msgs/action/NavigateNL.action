@@ -1,0 +1,24 @@
+# Version: 0.1
+# Natural-language navigation (m20_nlnav). Text in -> resolved RunMission -> driven.
+# The language layer only chooses goal poses; m20_missions + Nav2 drive (ADR-014), and the
+# Commander can still veto (ADR-005).
+string text
+uint8 MODE_DEV=0                # RESERVED: there is one mode for now (several matches -> the
+uint8 MODE_DEMO=1               # highest-confidence one); m20_nlnav ignores this field. Kept so
+uint8 mode                      # the interface doesn't need a rebuild if a second mode returns.
+bool dry_run                    # true = resolve only (preview/confirm); false = resolve + drive
+int32 pick_id                   # force a specific object id (e.g. m20 say --pick); -1 = none
+---
+bool success
+string status                   # plan | not_found | error | done | canceled | stopped
+string interpretation           # human-readable, e.g. "printer #14 (0.82)"
+m20_msgs/MissionItem[] items    # the resolved goals (map frame)
+m20_msgs/NLCandidate[] candidates
+uint8 tier                      # 0 = exact match (Phase 1)
+float32 latency_ms              # time to resolve (not to drive)
+string detail
+---
+string stage                    # resolving | navigating
+uint32 current_index            # forwarded from RunMission feedback
+string current_label
+string status

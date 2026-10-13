@@ -314,6 +314,21 @@ sleep 14
 echo "[5.5/7] starting mission server (/m20/mission/run — tools/dev/m20 goto|mission)"
 docker exec -d $C bash -lc "$SRC; python3 /cfg/mission_server.py >/cfg/out/mission.log 2>&1"
 
+# NL navigation (src/m20_nlnav): text -> goals -> RunMission. Hot-loaded from the REPO like the
+# behavior engine (python changes need no image rebuild; the NavigateNL action type does).
+# Named waypoints come from the scene yaml when the scene has one. Default on; M20_NLNAV=0 = off.
+if [ "${M20_NLNAV:-1}" = "1" ]; then
+  echo "[5.6/7] starting NL navigation (/m20/nlnav/navigate — tools/dev/m20 say \"...\")"
+  docker exec $C bash -lc "rm -rf /cfg/m20_nlnav /cfg/scene.yaml"
+  docker cp "$REPO/src/m20_nlnav/m20_nlnav" $C:/cfg/m20_nlnav
+  NL_SCENE=""
+  if [ -f "$REPO/tools/sim/${SCENE%.xml}.scene.yaml" ]; then
+    docker cp "$REPO/tools/sim/${SCENE%.xml}.scene.yaml" $C:/cfg/scene.yaml
+    NL_SCENE="-p scene_yaml:=/cfg/scene.yaml"
+  fi
+  docker exec -d $C bash -lc "$SRC; PYTHONPATH=/cfg:\$PYTHONPATH python3 -c 'from m20_nlnav.nlnav_node import main; main()' --ros-args $NL_SCENE >/cfg/out/nlnav.log 2>&1"
+fi
+
 if [ "${M20_STANDUP:-0}" != "1" ]; then
   echo "[6a/7] starting logger (standup path started it earlier)"
   docker exec -d $C bash -lc "$SRC; RUN_SECS=${RUN_SECS:-300} python3 /cfg/nav_logger.py >/cfg/out/logger.log 2>&1"

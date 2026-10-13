@@ -549,8 +549,52 @@ def start_ros(state):
                 e["gh"].cancel_goal_async()
             state.status = "stopping explore..."
 
+    # Natural-language navigation (src/m20_nlnav): text -> NavigateNL action. The NL node
+    # resolves the text and drives through the mission server; this is just its client.
+    nl = {"client": None, "gh": None, "type": None}
+    try:
+        from m20_msgs.action import NavigateNL
+        nl["type"] = NavigateNL
+        nl["client"] = ActionClient(node, NavigateNL, "/m20/nlnav/navigate")
+    except ImportError:
+        node.get_logger().warn("m20_msgs has no NavigateNL (old image) — NL panel disabled")
+
+    def nl_result_dict(r):
+        return {"status": r.status, "success": r.success, "interpretation": r.interpretation,
+                "detail": r.detail, "latency_ms": r.latency_ms, "tier": r.tier,
+                "cands": [(c.object_id, c.cls, (c.position.x, c.position.y, c.position.z), c.score, c.why)
+                          for c in r.candidates],
+                "goals": [(it.label, it.goal.pose.position.x, it.goal.pose.position.y,
+                           2 * math.atan2(it.goal.pose.orientation.z, it.goal.pose.orientation.w))
+                          for it in r.items]}
+
+    def say(text, mode, dry_run, pick_id, on_result, on_feedback=None):
+        """Send one NavigateNL goal; on_result(dict) when it finishes (see nl_result_dict)."""
+        cli = nl["client"]
+        if cli is None:
+            on_result({"status": "error", "detail": "NavigateNL missing — rebuild the m20_splat image"}); return
+        if not cli.wait_for_server(timeout_sec=2.0):
+            on_result({"status": "error", "detail": "NL navigation not running (bringup M20_NLNAV=1)"}); return
+        g = nl["type"].Goal()
+        g.text, g.mode, g.dry_run, g.pick_id = text, int(mode), bool(dry_run), int(pick_id)
+
+        def accepted(f):
+            gh = f.result()
+            if not gh.accepted:
+                on_result({"status": "error", "detail": "rejected by the NL node"}); return
+            if not dry_run:
+                nl["gh"] = gh
+            gh.get_result_async().add_done_callback(lambda r: on_result(nl_result_dict(r.result().result)))
+        cli.send_goal_async(g, feedback_callback=(lambda m: on_feedback(m.feedback)) if on_feedback else None
+                            ).add_done_callback(accepted)
+
+    def nl_cancel():
+        gh, nl["gh"] = nl["gh"], None
+        if gh is not None:
+            gh.cancel_goal_async()
+
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
-    return arm, goto, explore, stop
+    return arm, goto, explore, stop, say, nl_cancel
 
 
 def splat_renderer(g, deg, dev):
@@ -755,10 +799,24 @@ class MiniMap:
         if not self.trail or math.dist(self.trail[-1], (x, y)) > 0.05:
             self.trail.append((x, y))
 
-    def draw(self, pose=None, current=None, out_w=420, objects=()):
+    def draw(self, pose=None, current=None, out_w=420, objects=(), nl=None):
         """pose: (p, R) or None; current: 1-based index of the stop being driven to (None = idle);
-        objects: confirmed detections [{cls, xyz, ...}] drawn as labelled diamonds."""
+        objects: confirmed detections [{cls, xyz, ...}] drawn as labelled diamonds;
+        nl: natural-language plan overlay {"goals": [(x, y, yaw)], "targets": [(x, y)],
+        "cands": [(id, x, y)]} (magenta = chosen target, yellow numbers = candidates)."""
         cv2, img = self.cv2, self.base.copy()
+        if nl:
+            for oid, x, y in nl.get("cands", ()):
+                u, v = self.px(x, y)
+                cv2.circle(img, (u, v), 15, (255, 220, 0), 2, cv2.LINE_AA)
+                cv2.putText(img, f"#{oid}", (u - 14, v - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(img, f"#{oid}", (u - 14, v - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 0), 2, cv2.LINE_AA)
+            for x, y in nl.get("targets", ()):
+                cv2.circle(img, self.px(x, y), 22, (255, 0, 255), 4, cv2.LINE_AA)
+            for x, y, yaw in nl.get("goals", ()):
+                a, b = self.px(x, y), self.px(x + 0.8 * math.cos(yaw), y + 0.8 * math.sin(yaw))
+                cv2.circle(img, a, 7, (40, 230, 80), -1, cv2.LINE_AA)
+                cv2.arrowedLine(img, a, b, (40, 230, 80), 3, cv2.LINE_AA, tipLength=0.4)
         for o in objects:
             u, v = self.px(o["xyz"][0], o["xyz"][1])
             c = class_colour(o["cls"])
@@ -823,7 +881,7 @@ def main():
     tour = [tuple(p) for p in scene.get("tour", [])]
     minimap = load_minimap(scene)
     state = State()
-    arm, goto, explore, stop = start_ros(state)
+    arm, goto, explore, stop, say, nl_cancel = start_ros(state)
 
     server = viser.ViserServer(host="0.0.0.0", port=PORT)
     server.scene.set_up_direction("+z")
@@ -859,6 +917,60 @@ def main():
         gy = server.gui.add_number("Goal y [m]", initial_value=-4.0, step=0.5)
         server.gui.add_button("Arm (ASSISTED)").on_click(lambda _: arm())
         server.gui.add_button("Go to goal").on_click(lambda _: goto(gx.value, gy.value))
+    # Natural-language navigation (docs/NL_NAVIGATION.md): type a command, the NL node resolves it
+    # and drives. One mode: when several objects match, it picks the highest-confidence one and says
+    # which ("nearest X" picks by distance). The plan is highlighted in 3D + on the mini-map.
+    NL_MODE = 1                                   # NavigateNL.mode (single mode; the field is ignored)
+    nl_view = {"res": None, "info": "", "ver": 0}
+    with server.gui.add_folder("Navigate (natural language)"):
+        nl_text = server.gui.add_text("Command", initial_value="go to the printer",
+                                      hint="e.g. 'go to the nearest trash can', 'go to stop 3', "
+                                           "'go to the printer then come back', 'stop'")
+        nl_go = server.gui.add_button("Go")
+        nl_stop = server.gui.add_button("Stop")
+        nl_info = server.gui.add_text("Understood", initial_value="", disabled=True, multiline=True)
+
+    def nl_show(res):
+        nl_view["res"] = res
+        ms = f" ({res['latency_ms']:.0f} ms)" if res.get("latency_ms") else ""
+        line = f"{res['status']}: {res.get('interpretation') or ''}".rstrip(": ")
+        nl_view["info"] = line + (f"\n{res['detail']}" if res.get("detail") else "") + ms
+        nl_view["ver"] += 1
+
+    def nl_feedback(f):
+        if f.stage == "navigating" and f.current_label:
+            nl_view["info"] = f"navigating [{f.current_index + 1}] {f.current_label}: {f.status}"
+            nl_view["ver"] += 1
+
+    def nl_drive(text):
+        stop()                                   # the tour and an NL command would fight over Nav2
+        nl_view["info"] = f"arming, then: {text}"
+        nl_view["ver"] += 1
+
+        def armed(ok):
+            if ok:
+                say(text, NL_MODE, False, -1, nl_show, nl_feedback)
+            else:
+                nl_show({"status": "error", "detail": f"could not arm ({state.status})"})
+        arm(armed)
+
+    def nl_halt(text="stop"):
+        nl_cancel(); stop()
+        say(text, NL_MODE, False, -1, nl_show)
+
+    @nl_go.on_click
+    def _(_):
+        text = nl_text.value.strip()
+        if not text:
+            return
+        if text.lower().strip(" .!") in ("stop", "cancel", "halt"):
+            nl_halt(text)
+        else:
+            nl_drive(text)
+
+    @nl_stop.on_click
+    def _(_):
+        nl_halt()
     map_panel = None
     if minimap is not None:
         with server.gui.add_folder("Top-down map (photoreal)"):
@@ -895,6 +1007,7 @@ def main():
     last_map_t, lap_ref, map_current = 0.0, None, None
     last_obj_t = 0.0                        # detector object-map summary + 3D boxes refresh
     box_handles = {}                        # object id -> ((label, box) handles, geometry key)
+    nl_seen, nl_handles, nl_overlay = -1, [], None    # NL plan highlight state (see nl_view)
     # lap recorder (while exploring) + replay. The newest saved lap is loaded at start.
     rec, rec_ref = None, None
     last_lap, lap_file = LapRecording.load_latest(LAPS_DIR)
@@ -1001,6 +1114,33 @@ def main():
                 explore(tour)
         status.value = state.status
         objects_now = replay_frame[0] if replay_frame else live_objects
+        if nl_view["ver"] != nl_seen:                 # NL panel + plan highlight (3D + mini-map)
+            nl_seen = nl_view["ver"]
+            nl_info.value = nl_view["info"]
+            res = nl_view["res"] or {}
+            for h_ in nl_handles:
+                h_.remove()
+            nl_handles = []
+            by_id = {c[0]: c for c in res.get("cands", [])}
+            sizes = {o["id"]: o.get("size") for o in (objects_now or [])}
+            goals = [(g[1], g[2], g[3]) for g in res.get("goals", [])]
+            tgt_ids = [int(g[0].split("#")[1]) for g in res.get("goals", []) if "#" in g[0]]
+            targets = [by_id[i] for i in tgt_ids if i in by_id]
+            nl_overlay = {"goals": goals, "targets": [(c[2][0], c[2][1]) for c in targets]} if res else None
+            for k, (x, y, yaw) in enumerate(goals):
+                cx, sy_ = math.cos(yaw), math.sin(yaw)
+                tip = (x + 0.7 * cx, y + 0.7 * sy_, 0.06)
+                segs = np.array([[(x, y, 0.06), tip],
+                                 [tip, (tip[0] - 0.2 * cx + 0.12 * sy_, tip[1] - 0.2 * sy_ - 0.12 * cx, 0.06)],
+                                 [tip, (tip[0] - 0.2 * cx - 0.12 * sy_, tip[1] - 0.2 * sy_ + 0.12 * cx, 0.06)]],
+                                np.float32)
+                nl_handles.append(server.scene.add_line_segments(f"/nl/goal{k}", segs, (40, 230, 80),
+                                                                 thickness=0.05))
+            for c in targets:
+                size = sizes.get(c[0]) or (0.5, 0.5, 0.5)
+                nl_handles.append(server.scene.add_box(f"/nl/target{c[0]}", color=(255, 0, 255),
+                                                       dimensions=tuple(1.15 * v for v in size),
+                                                       wireframe=True, position=tuple(c[2])))
         if t0 - last_img_t > 0.2 and (cam_img is not None or det_fresh):
             if replay_frame:          # the recorded frame (already annotated if detections were on)
                 cam_panel.image = cam_img
@@ -1053,7 +1193,7 @@ def main():
                     map_current = max(e["i"], 1)
                 cur, objs_map = map_current, live_objects
             map_panel.image = minimap.draw(pose, cur, objects=[o for o in objs_map if o.get("score", 0) >= min_conf.value]
-                                           if show_det.value else ())
+                                           if show_det.value else (), nl=None if replay_frame else nl_overlay)
             last_map_t = t0
         n_clients = 0
         for client in list(server.get_clients().values()):

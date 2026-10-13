@@ -80,9 +80,14 @@ done
 
 # ---------------------------------------------------------------- 3. commander
 step "3/6 commander container"
-if docker ps --format '{{.Names}}' | grep -q '^docker-commander-1$'; then ok "docker-commander-1 running"
-elif [ $CHECK = 1 ]; then todo "commander (docker compose up -d commander)"
-else (cd "$REPO/docker" && docker compose up -d commander) && ok "commander started"; fi
+img_of() { docker inspect -f '{{.Image}}' "$1" 2>/dev/null; }
+if docker ps --format '{{.Names}}' | grep -q '^docker-commander-1$' \
+   && [ "$(img_of docker-commander-1)" = "$(docker image inspect -f '{{.Id}}' m20_autonomy:latest 2>/dev/null)" ]; then
+  ok "docker-commander-1 running (current image)"
+elif [ $CHECK = 1 ]; then todo "commander missing or on an old image (docker compose up -d commander)"
+else   # compose recreates it when m20_autonomy was rebuilt (new msgs must reach the running stack)
+  (cd "$REPO/docker" && docker compose up -d commander) && ok "commander (re)started on the current image"
+fi
 
 # ---------------------------------------------------------------- 4. MuJoCo model + scenes
 step "4/6 MuJoCo robot model + scenes"

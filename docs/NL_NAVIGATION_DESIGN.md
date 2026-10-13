@@ -1,90 +1,110 @@
 # Natural-language navigation: technical design
 
 Status: **draft for review**. Requirements: [NL_NAVIGATION.md](NL_NAVIGATION.md).
-Target: the splat demo on branch `3dgs-sim-env`, with every model running on the dev laptop.
+Target: the splat demo (branch `3dgs-sim-nl-navigation`), with every model running on the dev laptop.
+Phase 1 (tier 0, no models) is implemented; tiers 1–2 below are still the design.
 
 ## 1. Overview
 
+NL navigation is a **ROS package, `src/m20_nlnav`**, that sits in front of the mission server,
+the same way the `tools/dev/m20` CLI does. It follows the repo's existing workflow:
+- it's a node in the stack;
+- dev bringup hot-loads its Python from the repo;
+- production runs it as a compose service.
+
 ```
-Viser text box ──/nlnav/request──▶ nlnav_node ──/nlnav/response──▶ Viser
-                                      │                             │ (dev: user picks / confirms;
-          world model ◀───────────────┤                             │  demo: auto)
-   /detections/objects (object map)   │ tier 0: exact match          ▼
-   scene yaml waypoints:              │ tier 1: local LLM → query  RunMission (N × TYPE_GOTO)
-   /odom_true (robot pose)            │ resolve: geometry + rank      │
-   /global_costmap/costmap            │ tier 2: VLM attribute check   ▼
-   object crops + keyframes (disk)    │ approach pose (costmap)    mission server → Nav2
-                                      ▼
-                         Ollama (local LLM + VLM, GPU)
+Viser panel ─┐                         ┌─ /detections/objects (object map, JSON)
+m20 say ─────┼─ NavigateNL action ──▶ nlnav_node ◀─ /odom_true (pose), /global_costmap/costmap
+(prod client)┘  /m20/nlnav/navigate    │   ◀─ scene yaml waypoints:
+                (feedback, cancel)     │ tier 0: exact match        (Phase 1)
+                                       │ tier 1: local LLM → query  (Phase 2)
+                                       │ resolve: geometry + rank, tier 2 VLM (Phase 3)
+                                       │ approach pose on the costmap
+                                       ▼
+                         RunMission (N × TYPE_GOTO) → m20_missions → Nav2
+                         /m20/nlnav/markers (Foxglove / RViz)
 ```
 
 Design rules:
 1. **Language never drives the robot directly.**
-   - The LLM outputs a structured **query**.
-   - Plain code resolves the query against what the robot has actually seen and produces goal
-     poses.
-   - Those poses go through the existing mission server, Nav2 and commander, unchanged.
-2. **Understanding and executing are separate.**
-   - `nlnav_node` takes text in and returns a **plan** (goal poses plus explanation).
-   - The Viser viewer executes the plan using its existing `RunMission` client (`send()` in
-     `tools/splat/splat_viewer.py`), so it stays the **only goal sender** in the demo and can't
-     race the explore tour.
-   - In production, a thin executor replaces the viewer.
-3. **A ROS-free core.** Parsing, resolving and approach-pose code is plain Python (numpy only),
-   unit-tested in CI with a fake LLM. `nlnav_node.py` is a thin ROS wrapper.
+   - The parser (later, the LLM) outputs a structured **query**.
+   - Plain code resolves it against what the robot has actually seen and produces goal poses.
+   - Those poses go through the existing mission server, Nav2 and commander, unchanged
+     (ADR-014, ADR-005).
+2. **One entry point for every caller.** Viser, the CLI and production clients all call the
+   same action. The node executes through `RunMission` and forwards feedback and cancel.
+   - `dry_run` returns the plan without driving, for dev preview and confirm.
+   - A new command cancels the node's previous mission. `stop` cancels it outright.
+   - Callers that start missions themselves (the Viser explore tour) must stop them first;
+     the viewer does this.
+3. **Testable without the stack.** The logic modules (`world`, `tier0`, `resolve`,
+   `approach`) import no rclpy.
+   - **Fast CI job:** plain pytest on the logic.
+   - **ROS CI job:** `colcon test` runs `src/m20_nlnav/test/test_node.py` with real rclpy, a
+     fake mission server and fixture topics.
 
 ## 2. Components and files
 
 | File | Role |
 |---|---|
-| `tools/nlnav/schema.py` | Query / plan dataclasses + JSON schema (built per request with live enums) |
-| `tools/nlnav/world.py` | `WorldSnapshot`: objects, waypoints, robot pose, costmap; synonyms → detector classes |
-| `tools/nlnav/tier0.py` | Exact / fuzzy matcher for single-target commands and stop/cancel |
-| `tools/nlnav/backends.py` | `Backend` interface; `OllamaBackend` (default), `AnthropicBackend` (optional, off), `FakeBackend` (tests) |
-| `tools/nlnav/parse.py` | Tier routing: tier 0 → tier 1 LLM → validate → (fallback) bigger model |
-| `tools/nlnav/resolve.py` | Candidate filtering (class, relations, ordinal), tier 2 attribute check, ranking, ambiguity policy |
-| `tools/nlnav/approach.py` | Approach-pose search on the costmap |
-| `tools/nlnav/prompts/` | System prompts + few-shot examples (versioned text files) |
-| `tools/nlnav/nlnav_node.py` | ROS wrapper: subscriptions, request/response topics, timing |
-| `tools/nlnav/eval/` | Golden command set + saved object-map snapshot + `run_eval.py` |
-| `tools/splat/splat_viewer.py` | "Navigate" GUI folder, multi-item `send()`, target highlight, plan execution |
-| `tools/splat/detector_node.py` | Per-object best crops + keyframe store (for tier 2 and open-vocabulary search) |
-| `tools/sim/indoor_splat.scene.yaml` | New `waypoints:` block (names → x, y, yaw) |
-| `tools/splat/extract_geometry.py` | Preserve `waypoints:` across re-extraction (same as the `topdown:` block, l.339) |
-| `tools/splat/splat_sim_up.sh` | `M20_NLNAV=1` (default on): start the Ollama + nlnav containers |
-| `tests/test_nlnav_*.py` | Unit tests (ROS-free, run in CI) |
+| `src/m20_msgs/action/NavigateNL.action`, `msg/NLCandidate.msg` | The interface (§3) |
+| `src/m20_nlnav/m20_nlnav/world.py` | World model: objects, waypoints, pose, cost grid; detector classes + synonyms |
+| `src/m20_nlnav/m20_nlnav/tier0.py` | Exact-match parser (Phase 1). Returns None for anything it can't fully parse |
+| `src/m20_nlnav/m20_nlnav/resolve.py` | Candidates, ranking, dev/demo ambiguity policy, multi-step chaining |
+| `src/m20_nlnav/m20_nlnav/approach.py` | Approach-pose search on the costmap |
+| `src/m20_nlnav/m20_nlnav/nlnav_node.py` | ROS node: subscriptions, NavigateNL server, RunMission client, markers, health |
+| `src/m20_nlnav/test/test_node.py` | ROS-level test (colcon test) |
+| `tests/test_nlnav_{tier0,resolve,approach}.py` | Fast logic tests |
+| `tools/nav/bringup_plan_a.sh` | Hot-loads the node into the commander container (`M20_NLNAV`, default 1) |
+| `docker/compose.yaml` | `nlnav` service (prod) |
+| `tools/dev/m20` | `m20 say "..." [--dev] [--dry-run] [--pick ID]` |
+| `tools/splat/splat_viewer.py` | "Navigate (natural language)" panel, plan highlight in 3D + mini-map |
+| `tools/sim/indoor_splat*.scene.yaml` | `waypoints:` block (start, stop 1–13) |
+| `tools/splat/extract_geometry.py` | Preserves `waypoints:` across re-extraction (while the frame is unchanged) |
+| Later: `m20_nlnav/{backends,parse}.py`, `prompts/`, `eval/` | Tiers 1–2 (LLM / VLM via Ollama), eval set |
+| Later: `tools/splat/detector_node.py` | Per-object crops + keyframes (tier 2, open-vocabulary search) |
 
-All new runtime code runs in the existing `m20_splat` image: it has rclpy, numpy, torch and
-OWLv2, and the Ollama client uses only `urllib`. **No image rebuild** is needed. Ollama runs in
-the stock `ollama/ollama` container.
+**Rebuilds:**
+- Python changes need **no image rebuild**: bringup copies `src/m20_nlnav/m20_nlnav` into
+  `/cfg` and runs it, like the behaviour engine.
+- Interface changes (`m20_msgs`) do. Rebuild `m20_autonomy` → `m20_sim` → `m20_splat` (the
+  viewer imports the action) with `bash tools/splat/setup_splat_demo.sh --rebuild`.
 
-## 3. Interfaces
+## 3. Interface: `m20_msgs/action/NavigateNL` (`/m20/nlnav/navigate`)
 
-The interfaces use JSON on `std_msgs/String`, the same pattern as `/detections/objects`. This
-avoids an `m20_msgs` change and an image rebuild while the design settles. **Prod:** promote
-them to an `m20_msgs/action/NavigateNL`, with goal = text, feedback = plan/step and
-result = outcome.
-
-**`/nlnav/request`**
-```json
-{"id": "r42", "text": "go to the chair next to the whiteboard", "mode": "dev",
- "pick": null}
 ```
-`pick` holds the user's choice from the candidates in a dev-mode `ask` response. The text is
-re-resolved with that choice fixed.
-
-**`/nlnav/response`**
-```json
-{"id": "r42", "status": "plan",            // plan | ask | not_found | error | stopped
- "tier": 1, "interpretation": "office chair #7 (near whiteboard #3, 0.9 m)",
- "steps": [{"label": "office chair #7",
-            "target": {"kind": "object", "id": 7, "cls": "office chair", "xyz": [3.1, -4.2, 0.5]},
-            "goal": [2.3, -4.0, -0.24], "confidence": 0.81,
-            "candidates": [{"id": 7, "score": 0.81, "why": "0.9 m from whiteboard"},
-                           {"id": 9, "score": 0.74, "why": "1.4 m from whiteboard"}]}],
- "latency_ms": {"tier0": 2, "llm": 640, "vlm": 0, "resolve": 8, "total": 655},
- "message": "Going to the office chair next to the whiteboard."}
+# goal
+string text
+uint8 MODE_DEV=0          # ambiguity -> status "ask" with candidates (human picks)
+uint8 MODE_DEMO=1         # ambiguity -> highest-confidence match
+uint8 mode
+bool dry_run              # resolve only (preview / confirm); false = resolve + drive
+int32 pick_id             # dev follow-up: the chosen candidate's object id; -1 = none
+---
+bool success
+string status             # plan | ask | not_found | error | done | canceled | stopped
+string interpretation     # "printer #14 (0.82) → stop 3"
+m20_msgs/MissionItem[] items         # the resolved goals (map frame)
+m20_msgs/NLCandidate[] candidates    # object_id, cls, position, score, why
+uint8 tier
+float32 latency_ms        # time to resolve (not to drive)
+string detail             # reason / help text
+---
+string stage              # resolving | navigating
+uint32 current_index      # forwarded from RunMission feedback
+string current_label
+string status
 ```
+
+**Dev flow:**
+1. Send `dry_run` → get `plan` or `ask`, and highlight it.
+2. Re-send with `pick_id` if the answer was `ask`.
+3. Send with `dry_run=false` to drive.
+
+**Demo flow:** send with `dry_run=false` straight away.
+
+**Node parameters:** `scene_yaml`, `min_score` (0.5), `odom_topic` (`/odom_true`), `objects_topic`,
+`costmap_topic` (fallback), `costmap_service` (`/global_costmap/get_costmap`, queried per command).
 
 ## 4. Structured query (what the LLM must output)
 

@@ -19,6 +19,23 @@ boxes: 2673
 # exploration tour (world/map frame, metres), visited in order; last = spawn
 tour: [[-0.50, -5.60], [0.00, -8.70], [0.80, -18.10], [4.10, -19.70], [5.80, -17.00], [8.40, -16.50], [8.40, -13.80], [7.70, -10.30], [8.60, -5.70], [7.10, -2.40], [5.70, 3.10], [1.80, 2.70], [0.00, 0.00]]
 params: {cell: 0.1, min_opacity: 0.5, max_scale: 0.3, z_min: 0.15, z_max: 2.2, layer: 0.1, min_count: 4, min_layers: 2, min_blob: 3, close: 2, boundary_wall: 2.0, height_step: 0.4}
+waypoints:
+  # named places for NL navigation (src/m20_nlnav; world/map frame, metres): name: [x, y] or [x, y, yaw]
+  # hand-edited - extract_geometry.py keeps this block while the frame (splat_to_world) is unchanged
+  start: [0.00, 0.00, 0.00]
+  stop 1: [-0.50, -5.60]
+  stop 2: [0.00, -8.70]
+  stop 3: [0.80, -18.10]
+  stop 4: [4.10, -19.70]
+  stop 5: [5.80, -17.00]
+  stop 6: [8.40, -16.50]
+  stop 7: [8.40, -13.80]
+  stop 8: [7.70, -10.30]
+  stop 9: [8.60, -5.70]
+  stop 10: [7.10, -2.40]
+  stop 11: [5.70, 3.10]
+  stop 12: [1.80, 2.70]
+  stop 13: [0.00, 0.00]
 topdown:
   # photoreal top-down map (tools/splat/render_topdown.py); world(x, y) -> pixel:
   #   u = (x - x0) * px_per_m,  v = (y1 - y) * px_per_m   (north = image up)

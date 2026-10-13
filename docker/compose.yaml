@@ -68,6 +68,16 @@ services:
       - "HEALTH_NODE=m20_mission_server"
     healthcheck: *hc
 
+  nlnav:
+    # natural-language navigation front end to the mission server (src/m20_nlnav).
+    # On the robot set odom_topic to the localized pose source and scene_yaml to the site's waypoints.
+    <<: *stack
+    command: ros2 run m20_nlnav nlnav_node
+    environment:
+      - "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}"
+      - "HEALTH_NODE=m20_nlnav"
+    healthcheck: *hc
+
   station_bridge:
     <<: *stack
     # ROS 2 launch args use name:=value; only pass robot_id when set (empty = single robot, ADR-014).

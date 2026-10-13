@@ -14,9 +14,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BehaviorRequest.msg"
   "msg/BehaviorStatus.msg"
   "msg/ControlAuthority.msg"
+  "msg/NLCandidate.msg"
   "srv/SetMode.srv"
   "srv/SetControlAuthority.srv"
   "action/RunMission.action"
+  "action/NavigateNL.action"
   DEPENDENCIES std_msgs geometry_msgs action_msgs
 )
 ament_package()

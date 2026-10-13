@@ -21,6 +21,23 @@ derived_from: indoor_splat.scene.yaml
 # exploration tour (world/map frame, metres), visited in order; last = spawn
 tour: [[-0.50, -5.60], [0.00, -8.70], [0.80, -18.10], [4.10, -19.70], [5.80, -17.00], [8.40, -16.50], [8.40, -13.80], [7.70, -10.30], [8.60, -5.70], [7.10, -2.40], [5.70, 3.10], [1.80, 2.70], [0.00, 0.00]]
 params: {voxel: 0.04, trunc: 0.120, min_weight: 2, z_cut: 0.1, z_top: 2.3, min_blob_vox: 40, tile: 3.0, coacd_threshold: 0.15, fill_min: 0.3, max_verts: 16, boundary_wall: 2.0}
+waypoints:
+  # named places for NL navigation (src/m20_nlnav; world/map frame, metres): name: [x, y] or [x, y, yaw]
+  # hand-edited - extract_geometry.py keeps this block while the frame (splat_to_world) is unchanged
+  start: [0.00, 0.00, 0.00]
+  stop 1: [-0.50, -5.60]
+  stop 2: [0.00, -8.70]
+  stop 3: [0.80, -18.10]
+  stop 4: [4.10, -19.70]
+  stop 5: [5.80, -17.00]
+  stop 6: [8.40, -16.50]
+  stop 7: [8.40, -13.80]
+  stop 8: [7.70, -10.30]
+  stop 9: [8.60, -5.70]
+  stop 10: [7.10, -2.40]
+  stop 11: [5.70, 3.10]
+  stop 12: [1.80, 2.70]
+  stop 13: [0.00, 0.00]
 topdown:
   # photoreal top-down map (tools/splat/render_topdown.py); world(x, y) -> pixel:
   #   u = (x - x0) * px_per_m,  v = (y1 - y) * px_per_m   (north = image up)
