@@ -88,6 +88,19 @@ def place(depth, box, K, T_map_cam, band=0.35, max_range=6.0):
     return ((lo + hi) / 2).tolist(), size.tolist()
 
 
+def stale_frames(run_dir, frames):
+    """Ids of keyframes whose colour image is byte-identical to ANOTHER keyframe's in the same run. A frozen camera
+    picture saved at several poses places one detection at several map positions (circuit4 run 1: kf_00226-229, the
+    tip-over, one view of a desk -> three "desks" 1.5 m apart). Every member of such a group is dropped: once the
+    picture froze, nothing says which pose it really belongs to."""
+    import hashlib
+    groups = {}
+    for fr in frames:
+        with open(os.path.join(run_dir, fr["id"] + ".jpg"), "rb") as f:
+            groups.setdefault(hashlib.md5(f.read()).hexdigest(), []).append(fr["id"])
+    return {i for ids in groups.values() if len(ids) > 1 for i in ids}
+
+
 def build(run_dirs, out_path, min_sightings=2, max_area=0.35, every=1, log=print):
     """run_dirs: one mapping run or several of the same site (e.g. a run that ended early + its --resume);
     their keyframes are pooled, so an object seen in both runs merges into one."""
@@ -98,7 +111,12 @@ def build(run_dirs, out_path, min_sightings=2, max_area=0.35, every=1, log=print
     frames, Ks = [], {}
     for rd in run_dirs:
         Ks[rd] = json.load(open(os.path.join(rd, "camera.json")))
-        frames += [dict(json.loads(l), run=rd) for l in open(os.path.join(rd, "index.jsonl"))][::every]
+        run_frames = [dict(json.loads(l), run=rd) for l in open(os.path.join(rd, "index.jsonl"))][::every]
+        stale = stale_frames(rd, run_frames)
+        if stale:
+            log(f"[build] {os.path.basename(rd)}: dropping {len(stale)} keyframes with a frozen (repeated) image: "
+                f"{sorted(stale)}")
+        frames += [fr for fr in run_frames if fr["id"] not in stale]
     log(f"[build] {len(frames)} keyframes from {len(run_dirs)} run(s)")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import Owlv2ForObjectDetection, Owlv2Processor

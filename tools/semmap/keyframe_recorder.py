@@ -26,6 +26,8 @@ from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 
+from frozen_frames import FrozenFrameGuard          # same directory (the script's dir is on sys.path)
+
 OUT = os.environ["SEMMAP_OUT"]
 KF_DIST = float(os.environ.get("KF_DIST", 0.4))
 KF_ANGLE = math.radians(float(os.environ.get("KF_ANGLE", 15)))
@@ -58,6 +60,7 @@ class Recorder(Node):
         self.tf = Buffer()
         self._tfl = TransformListener(self.tf, self)
         self.pending, self.last_T, self.n, self.info_saved = {}, None, 0, False
+        self.frozen = FrozenFrameGuard()
         self.index = open(os.path.join(OUT, "index.jsonl"), "a")
         self.create_subscription(Image, os.environ.get("CAM_TOPIC", "/camera/image_raw"),
                                  lambda m: self.on_frame("c", m), qos_profile_sensor_data)
@@ -90,6 +93,11 @@ class Recorder(Node):
             return
         if not moved_enough(self.last_T, T):
             return
+        if self.frozen.is_frozen(cm.data):               # see frozen_frames.py
+            self.get_logger().warn("camera image unchanged while the robot moved: frozen frame, not saved",
+                                   throttle_duration_sec=5.0)
+            return
+        self.frozen.saved(cm.data)
         self.last_T = T
         self.n += 1
         kid = f"kf_{self.n:05d}"
