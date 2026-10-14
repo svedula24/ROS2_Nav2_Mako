@@ -116,6 +116,7 @@ class GodotBridge(Node):
         self.armed, self.cmd, self.cmd_t, self.sent_zero = False, (0.0, 0.0), 0.0, True
         self.gyro_z, self.trim, self.last_tick = 0.0, gio.YawTrim(), time.monotonic()
         self.sim_ok, self.sim_err = True, ""
+        self.state_stamp = None                        # stamp of the last published pose/TF (sensor_stamp)
         self.lock = threading.Lock()
         self.latest_lidar = {}                         # index -> points (in the z band)
         self.frames = {"c": {}, "d": {}}               # seq -> (header, pixels): newest few only
@@ -207,6 +208,9 @@ class GodotBridge(Node):
         tf.transform.translation.x, tf.transform.translation.y = float(px), float(py)
         tf.transform.rotation.z, tf.transform.rotation.w = od.pose.pose.orientation.z, od.pose.pose.orientation.w
         self.tf_bc.sendTransform(tf)
+        # Only now may sensors use this stamp (see publish_camera): set before sendTransform, a camera/lidar
+        # thread could stamp a frame with a pose TF doesn't have yet, which is the MessageFilter wait again.
+        self.state_stamp = now
 
         ot = Odometry()
         ot.header.stamp, ot.header.frame_id, ot.child_frame_id = now, "map", "base_link_true"
@@ -283,10 +287,15 @@ class GodotBridge(Node):
 
     def publish_camera(self, ch, cpx, dh, dpx):
         w, h = ch["w"], ch["h"]
-        # Stamped on THIS process's clock (the same one as /odom and TF), not the sim's capture
-        # time: Windows' clock runs ~0.15 s ahead of WSL's, and future-stamped clouds made the
-        # costmaps drop every observation (TF can't extrapolate forward).
-        stamp = self.get_clock().now().to_msg()
+        # Stamped with the LATEST PUBLISHED POSE/TF STAMP, not now(): (1) Windows' clock runs ~0.15 s
+        # ahead of WSL's, and future-stamped clouds made the costmaps drop every observation (TF can't
+        # extrapolate forward); (2) even now() from this process is a few ms past the last TF, so every
+        # cloud sat in nav2's tf2 MessageFilter waiting for the next TF. Those waits spawn timeout timers
+        # that the TF-listener thread cancels when TF arrives, and that race froze BOTH costmaps' TF
+        # buffers (robot pose stuck at spawn, silently, 30-80 s after activation; seen twice). A stamp
+        # that TF already covers is transformable at once: no wait, no timer, no race. The pose is at
+        # most one telemetry period (20 ms) older than the frame, which is below the sensors' own latency.
+        stamp = self.sensor_stamp()
         img = Image()
         img.header.stamp, img.header.frame_id = stamp, "camera_optical_link"
         img.height, img.width, img.encoding, img.step = h, w, "rgb8", w * 3
@@ -330,7 +339,11 @@ class GodotBridge(Node):
                                        rmin=L["range"][0], rmax=L["range"][1])
                 self.latest_lidar[i] = pts[(pts[:, 2] > ZBAND[0]) & (pts[:, 2] < ZBAND[1])]
             self.cloud_pub.publish(cloud_msg(np.concatenate(list(self.latest_lidar.values())), "base_link",
-                                             self.get_clock().now().to_msg()))
+                                             self.sensor_stamp()))
+
+    def sensor_stamp(self):
+        """Stamp for sensor messages: the latest pose/TF stamp (publish_camera explains why), else now."""
+        return self.state_stamp or self.get_clock().now().to_msg()
 
     # ---------------------------------------------------------------- health
     def _sim_down(self, why):
