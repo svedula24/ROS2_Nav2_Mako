@@ -2,10 +2,16 @@
 # The Mako stack on the Godot sim (Bright Robotics Simulator, M20 on circuit4). STAYS IN THE
 # FOREGROUND: Ctrl-C tears the ROS stack down (the Godot window stays unless --stop-sim).
 #
-#   bash tools/godot/godot_sim_up.sh            Godot window + bridge + commander/Nav2/mission/NL/detector
-#   bash tools/godot/godot_sim_up.sh --viser    ... plus the Viser viewer on http://localhost:8080
-#   bash tools/godot/godot_sim_up.sh --stop-sim also quit the Godot sim on exit
+#   bash tools/godot/godot_sim_up.sh              Godot window + bridge + commander/Nav2 (site map)/mission
+#                                                 + NL navigation (offline phase: LLM + object map)
+#   bash tools/godot/godot_sim_up.sh --viser      ... plus the Viser viewer on http://localhost:8080
+#   bash tools/godot/godot_sim_up.sh --detect     ... plus the live OWLv2 detector (mapping runs)
+#   bash tools/godot/godot_sim_up.sh --no-site-map   live costmaps only (no Nav2 static map)
+#   bash tools/godot/godot_sim_up.sh --object-map <json>   default ~/m20_sim/semmap/circuit4/object_map.json
+#   bash tools/godot/godot_sim_up.sh --stop-sim   also quit the Godot sim on exit
 #   then:  tools/dev/m20 say "go to the ladder"
+# The local LLM (Ollama, NLNAV_LLM_MODEL, default qwen2.5:7b-instruct) runs in m20_ollama and is kept
+# running between launches (the model stays loaded); NLNAV_LLM=claude switches to the Anthropic API.
 #
 # Needs WSL mirrored networking (the sim serves its streams on Windows' 127.0.0.1 only), the Godot
 # sim (GODOT_EXE, GODOT_SIM) and the circuit4 site baked on Windows. A sim that already answers on
@@ -17,14 +23,20 @@ GODOT_SIM="${GODOT_SIM:-$(dirname "$REPO")/stateful-drone-sim}"
 SITE="${GODOT_SITE:-circuit4_cam_mesh}"
 SCENE="godot_circuit4.xml"                      # tools/sim/godot_circuit4.scene.yaml (waypoints, splat frame)
 PORT="${VIEW_PORT:-8080}"
-VISER=0; STOP_SIM=0
-for a in "$@"; do
-  case "$a" in
+VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"
+OBJECT_MAP="$HOME/m20_sim/semmap/circuit4/object_map.json"
+LLM="${NLNAV_LLM:-ollama}"; LLM_MODEL="${NLNAV_LLM_MODEL:-qwen2.5:7b-instruct}"
+while [ $# -gt 0 ]; do
+  case "$1" in
     --viser) VISER=1 ;;
     --stop-sim) STOP_SIM=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
-    *) echo "unknown option $a (see --help)"; exit 2 ;;
+    --detect) DETECT=1 ;;
+    --no-site-map) SITE_MAP="" ;;
+    --object-map) OBJECT_MAP="$2"; shift ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) echo "unknown option $1 (see --help)"; exit 2 ;;
   esac
+  shift
 done
 
 api_up() { python3 - <<'PY'
@@ -45,6 +57,8 @@ PY
 cleanup() {
   trap - INT TERM EXIT
   echo; echo "[godot_sim_up] tearing down..."
+  # `|| true`: under set -e a failed kill (watchdog already gone) would abort the trap before kill_stack
+  [ -n "${WATCHDOG_PID:-}" ] && { kill "$WATCHDOG_PID" 2>/dev/null || true; }
   bash "$REPO/tools/nav/kill_stack.sh" >/dev/null 2>&1 || true
   [ "$STOP_SIM" = "1" ] && { sim_quit; echo "[godot_sim_up] Godot sim asked to quit."; }
   echo "[godot_sim_up] down."
@@ -80,16 +94,54 @@ docker run -d --name m20_godot_bridge --network host --ipc host \
 sleep 6
 
 # 3. the usual stack, minus the MuJoCo pieces (bringup M20_EXTERNAL_SIM=1); ground-truth localisation
-M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=1 M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 \
-M20_MAX_VEL="${GODOT_VMAX:-0.5}" bash "$REPO/tools/nav/bringup_plan_a.sh"
+# NL navigation runs in its own container (step 4b: it needs OWLv2's text encoder), not the commander.
+M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=1 M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
+M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="${GODOT_VMAX:-0.5}" bash "$REPO/tools/nav/bringup_plan_a.sh"
 # the mission server (m20 say / goto) needs ASSISTED; bringup leaves TELEOP
 SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 arm() { docker exec docker-commander-1 bash -lc "$SRC; ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: godot_sim_up}'" | grep -c "accepted=True" || true; }
 if [ "$(arm 2)" = "0" ]; then arm 0 >/dev/null; arm 2 >/dev/null; fi   # refused (e.g. latched ESTOP): via IDLE
 echo "[godot_sim_up] armed ASSISTED"
 
-# 4. object detector on the sim's camera (same container as the splat demo)
-if [ "${M20_DETECT:-1}" = "1" ]; then
+# 4a. local LLM for the structured query (kept running across launches: the model stays loaded)
+if [ "$LLM" = "ollama" ]; then
+  if ! docker ps --format '{{.Names}}' | grep -q '^m20_ollama$'; then
+    echo "[godot_sim_up] starting the local LLM (Ollama, $LLM_MODEL)"
+    docker rm -f m20_ollama >/dev/null 2>&1 || true
+    mkdir -p "$HOME/m20_sim/ollama"
+    docker run -d --name m20_ollama --gpus all --network host -e OLLAMA_HOST=127.0.0.1:11434 \
+      -e OLLAMA_KEEP_ALIVE=30m -v "$HOME/m20_sim/ollama":/root/.ollama ollama/ollama:latest >/dev/null
+    for i in $(seq 1 30); do docker exec m20_ollama ollama list >/dev/null 2>&1 && break; sleep 1; done
+  fi
+  docker exec m20_ollama ollama list | grep -q "^${LLM_MODEL}" || {
+    echo "[godot_sim_up] pulling $LLM_MODEL (once, a few GB)..."; docker exec m20_ollama ollama pull "$LLM_MODEL"; }
+fi
+
+# 4b. NL navigation: LLM query -> object map lookup -> approach pose -> RunMission
+[ -f "$OBJECT_MAP" ] || echo "[godot_sim_up] NOTE: no object map at $OBJECT_MAP: only named places will resolve (tools/semmap/record_mapping_run.sh, then build_object_map.sh)"
+echo "[godot_sim_up] starting NL navigation (llm=$LLM)"
+mkdir -p "$(dirname "$OBJECT_MAP")"
+NL_ENV=(-e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUNBUFFERED=1
+        -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e NLNAV_LLM="$LLM" -e NLNAV_LLM_MODEL="$LLM_MODEL")
+[ -n "${ANTHROPIC_API_KEY:-}" ] && NL_ENV+=(-e ANTHROPIC_API_KEY)
+NL_CMD="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export PYTHONPATH=/nlnav:\$PYTHONPATH;"
+NL_CMD+=" python3 -c 'from m20_nlnav.nlnav_node import main; main()' --ros-args"
+NL_CMD+=" -p scene_yaml:=/scene/${SCENE%.xml}.scene.yaml -p object_map:=/semmap/$(basename "$OBJECT_MAP")"
+NL_CMD+=" -p llm:=$LLM -p text_encoder:=owl"
+docker rm -f m20_nlnav >/dev/null 2>&1 || true
+docker run -d --name m20_nlnav --network host --ipc host "${NL_ENV[@]}" \
+  -v "$REPO/src/m20_nlnav":/nlnav:ro -v "$REPO/tools/sim":/scene:ro -v "$(dirname "$OBJECT_MAP")":/semmap:ro \
+  m20_splat:latest bash -lc "$NL_CMD" >/dev/null
+
+# 4b'. Nav2 robot-pose watchdog: relaunches nav2 if a costmap's published footprint stops updating (the
+# silent frozen-pose failure of 2026-10-13; see the script's header). Log + backtraces in ~/m20_sim/watchdog
+# (persistent, ENGINEERING_RULES 4).
+mkdir -p "$HOME/m20_sim/watchdog"
+bash "$REPO/tools/nav/nav2_pose_watchdog.sh" >> "$HOME/m20_sim/watchdog/watchdog.log" 2>&1 &
+WATCHDOG_PID=$!
+
+# 4c. live object detector on the sim's camera (opt-in: the offline map is the source of truth)
+if [ "$DETECT" = "1" ]; then
   echo "[godot_sim_up] starting object detector"
   docker rm -f m20_detector >/dev/null 2>&1 || true
   docker run -d --name m20_detector --gpus all --network host --ipc host \
@@ -125,9 +177,21 @@ echo "=================================================================="
 echo " GODOT SIM:  the Godot window (M20 on $SITE)"
 [ "$VISER" = "1" ] && echo " VISER:      http://localhost:$PORT"
 echo " COMMANDS:   tools/dev/m20 say \"go to the ladder\"   |   tools/dev/m20 say stop"
+echo " MAPPING:    bash tools/semmap/record_mapping_run.sh   then   bash tools/semmap/build_object_map.sh <run>"
 echo " >>> LEAVE THIS TERMINAL OPEN <<<   (Ctrl-C here = shut the ROS stack down)"
+echo " >>> KEEP THE GODOT WINDOW UN-MINIMIZED <<<  (minimized = no rendering = no camera/lidar frames)"
 echo "=================================================================="
-while docker ps --format '{{.Names}}' | grep -q '^m20_godot_bridge$'; do
-  docker logs -f --since 1s m20_godot_bridge 2>&1 || sleep 3
+# The bridge is the stack's heartbeat: gone for good = tear everything down. A `docker restart
+# m20_godot_bridge` (picking up a code change) stops it for a second or two; give it 15 s to come
+# back before deciding it has exited, otherwise a restart takes the whole stack with it.
+gone=0
+while [ "$gone" -lt 5 ]; do
+  if docker ps --format '{{.Names}}' | grep -q '^m20_godot_bridge$'; then
+    gone=0
+    docker logs -f --since 1s m20_godot_bridge 2>&1 || true
+  else
+    gone=$((gone + 1))
+  fi
+  sleep 3
 done
 echo "[godot_sim_up] bridge exited — cleaning up the rest..."
