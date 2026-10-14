@@ -1,26 +1,129 @@
-# CI gate (ADR-011): every commit builds the container and runs colcon tests
-# inside it — the same artifact that deploys to the robot. Sim-gate jobs for
-# TIER_POLICY behaviors (ADR-010) will be added as a second job in Phase 8.
+# CI/CD (ADR-011). Every push / PR:
+#   static          bash -n + ShellCheck (errors only) on every shell script; every .py compiles
+#   unit            ROS-free logic tests (pytest + rclpy shims), the same as `make unit`
+#   build-and-test  builds the stack image (layer-cached) and runs colcon test INSIDE it: the same
+#                   artifact that deploys to the robot
+# Test reports (JUnit XML) are uploaded as run artifacts, also when tests fail.
+# CD is MANUAL: Actions -> ci -> Run workflow -> publish_image pushes the tested image to
+# ghcr.io/<owner>/m20_autonomy. Manual on purpose: the image is ~3.6 GB and private package storage on
+# the free plan is ~500 MB. Sim-gate jobs for TIER_POLICY behaviors (ADR-010) come later.
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: "Push the tested m20_autonomy image to ghcr.io (~3.6 GB of package storage)"
+        type: boolean
+        default: false
+
+concurrency:                     # a newer push to the same ref supersedes the running check
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  unit:
-    runs-on: ubuntu-latest
+  static:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+      - uses: actions/checkout@v7
+      - name: Shell scripts parse + ShellCheck (errors only)
+        run: |
+          set -euo pipefail
+          # every tracked *.sh, plus extensionless files with a sh/bash shebang (tools/dev/m20, m20sh)
+          mapfile -t SH < <(git ls-files | while read -r f; do
+            case "$f" in
+              *.sh) echo "$f" ;;
+              *.*) ;;
+              *) head -c 40 "$f" | grep -qE '^#!.*(ba)?sh' && echo "$f" || true ;;
+            esac
+          done)
+          [ "${#SH[@]}" -gt 0 ] || { echo "no shell scripts found: the file scan is broken"; exit 1; }
+          echo "${#SH[@]} scripts"
+          for f in "${SH[@]}"; do bash -n "$f"; done
+          shellcheck --version | head -2
+          # -S error: real bugs only; warnings would flag most pre-ENGINEERING_RULES scripts
+          shellcheck -S error "${SH[@]}"
+      - name: Python files compile (tools/ scripts have no tests to import them)
+        run: python3 -m compileall -q src tools tests
+
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - run: pip install pytest numpy
-      - run: python3 -m pytest tests -q
+      - run: python3 -m pytest tests -q --junitxml=reports/unit.xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: unit-test-report
+          path: reports/unit.xml
 
   build-and-test:
-    needs: unit
-    runs-on: ubuntu-latest
+    needs: [static, unit]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Build stack image
-        run: docker build -f docker/Dockerfile -t m20_autonomy:ci .
-      - name: colcon test
-        run: >
-          docker run --rm m20_autonomy:ci
-          bash -lc "source /ws/install/setup.bash && cd /ws && colcon test && colcon test-result --verbose"
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build stack image (layers cached in the GitHub Actions cache)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: m20_autonomy:ci
+          load: true
+          cache-from: type=gha,scope=m20_autonomy
+          cache-to: type=gha,scope=m20_autonomy,mode=max
+      - name: colcon test (inside the image)
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD/reports":/reports m20_autonomy:ci bash -lc '
+            source /ws/install/setup.bash && cd /ws || exit 1
+            colcon test; rc=$?
+            find build \( -name pytest.xml -o -path "*test_results*" -name "*.xml" \) -exec cp --parents {} /reports \;
+            colcon test-result --verbose || rc=1
+            exit $rc'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: colcon-test-reports
+          path: reports/
+          if-no-files-found: warn
+
+  publish-image:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/m20_autonomy
+          tags: |
+            type=sha
+            type=ref,event=branch
+      - name: Push the tested image (rebuilt from the same layer cache = the layers build-and-test ran)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=m20_autonomy
