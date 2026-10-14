@@ -9,8 +9,17 @@
 #   near_id/near_xy (drive) sanity bound: end within `near_m` of this object's map position / this point; the
 #                real arrival test is <= approach_tol_m (0.6) from the approach pose the planner chose
 #   stop_after_s (drive) send "stop" this many seconds in; expect canceled, roll-out <= max_rollout_m (0.5), then still
+#   max_loc_err_m (drive) localization: the robot's believed pose (TF map->base_link) stays within this of the
+#                sim's ground truth for the whole drive. SCAFFOLD: always recorded; 0 by construction while the
+#                stack runs on ground-truth localization; meant for AMCL vs ground truth.
+# known_issue: text   the expectation is RIGHT but the system currently fails it; the report lists these
+#                separately so a known failure can't hide a new one. Remove the key when fixed.
+# Ground truth for relation cases: the geometry of CONFIDENT objects (label >= 0.5, >= 3 sightings), seen from the
+# spawn (left/right/front/behind are relative to the robot's viewpoint). Ids accept duplicates of one physical
+# object (e.g. microwave #322 + #337 at the same spot) until the duplicate-placement bug is fixed.
 # Site: circuit4 (Godot). Object ids refer to ~/m20_sim/semmap/circuit4/object_map.json rebuilt 2026-10-14
-# from two runs (357 keyframes, 403 objects; full tour coverage). Rebuilding the map renumbers ids: update `ids`/`near_id` then.
+# from two runs (353 keyframes after dropping 4 frozen ones, 396 objects; full tour coverage). Rebuilding the map
+# renumbers ids: carry them over with tools/nlnav_eval/remap_ids.py OLD NEW --write.
 site: circuit4
 start_pose: [-2.13, 0.35, -1.6]        # x, y, yaw (rad): the spawn, facing south
 
@@ -23,16 +32,17 @@ cases:
     expect: {status: plan, labels: [trash can]}
   - name: desk_near_whiteboard
     text: "the desk near the whiteboard"
-    # the desks beside the whiteboard on an easel (#256, north end); all three tie, and they are low-confidence
-    # detections (0.33) so they display as "object": pin the ids, not the label
-    expect: {status: plan, ids: [[261, 264, 266]]}
+    # the desk cluster around whiteboard #295 (north-west): every desk within 1.5 m of it is right. (The earlier
+    # answer, three "desks" by whiteboard #256, were phantoms from frozen camera frames; #256 has no desk near it.)
+    expect: {status: plan, ids: [[307, 308, 310, 312, 313, 327]]}
   - name: ladder_then_start
     text: "go to the ladder then come back to the start"
     expect: {status: plan, labels: [ladder, start]}
   - name: fire_extinguisher_paraphrase
     text: "the thing you use to put out fires"
-    # #313: red wall cabinet with a window (north end), 0.44; before full coverage the best was a red blob (#22)
-    expect: {status: plan, ids: [313]}
+    # #306: red wall cabinet with a window (north end; #313 before the frozen-frame rebuild renumbered it);
+    # before full coverage the best was a red blob (#22)
+    expect: {status: plan, ids: [306]}
   - name: back_to_start
     text: "go back to the start"
     expect: {status: plan, labels: [start]}
@@ -51,6 +61,95 @@ cases:
   - name: long_valve_sentence
     text: "head over and find the valve right next to the big yellow tank, and then come back to the dock"
     expect: {status: not_found}
+
+  # ---- relations: one case per relation word (2026-10-14) ----
+  - name: rel_left_chair_whiteboard
+    text: "the office chair to the left of the whiteboard"
+    expect: {status: plan, ids: [372]}
+  - name: rel_right_desk_microwave
+    text: "go to the desk on the right of the microwave"
+    expect: {status: plan, ids: [254]}
+  - name: rel_left_desk_cone
+    text: "the desk left of the traffic cone"
+    expect: {status: plan, ids: [202]}
+  - name: rel_behind_whiteboard_microwave
+    text: "the whiteboard behind the microwave"
+    expect: {status: plan, ids: [256]}
+  - name: rel_near_chair_laptop
+    text: "the office chair near the laptop"
+    expect: {status: plan, ids: [29]}
+  - name: rel_right_trash_desk
+    text: "the trash can to the right of the desk"
+    known_issue: "anchor floor 0.10 too loose: picks trash can #236 anchored on a cardboard box scoring as 'desk'"
+    expect: {status: plan, ids: [1]}
+  - name: rel_front_whiteboard_chair
+    text: "the whiteboard in front of the office chair"
+    known_issue: "the true whiteboard #295 never ranks; weak anchors win (latest pick #115)"
+    expect: {status: plan, ids: [295]}
+  - name: rel_none_ladder_microwave
+    text: "the ladder next to the microwave"
+    known_issue: "no ladder near a microwave, but an office chair scoring 0.12 as 'ladder' clears the 0.10 floor"
+    expect: {status: not_found}
+
+  # ---- phrasing variants of known answers ----
+  - name: ph_take_me_ladder
+    text: "take me to the ladder"
+    expect: {status: plan, ids: [[28, 44]]}
+  - name: ph_bare_ladder
+    text: "ladder"
+    expect: {status: plan, ids: [[28, 44]]}
+  - name: ph_polite_ladder
+    text: "could you please head over to the ladder"
+    expect: {status: plan, ids: [[28, 44]]}
+  - name: ph_nearest_bin
+    text: "go to the nearest bin"
+    expect: {status: plan, ids: [1]}                 # the nearest real trash can from the spawn (3.8 m)
+  - name: ph_wastebasket
+    text: "find a wastebasket"
+    expect: {status: plan, labels: [trash can]}
+  - name: ph_microwave
+    text: "where is the microwave, go there"
+    expect: {status: plan, ids: [[315, 330]]}        # one microwave, two map entries (#337 tagged "printer")
+  - name: ph_laptop
+    text: "go to the laptop"
+    expect: {status: plan, ids: [[32, 92]]}          # one laptop, two entries 0.4 m apart
+  - name: ph_cone
+    text: "drive to the orange traffic cone"
+    expect: {status: plan, labels: [traffic cone]}
+
+  # ---- multi-step ----
+  - name: ms_ladder_then_nearest_trash
+    text: "go to the ladder, then the nearest trash can"
+    # step 2 is "nearest to the ladder"; its answer (#26, a thin unconfirmed detection) is not pinned yet
+    expect: {status: plan, ids: [[28, 44]]}
+  - name: ms_three_steps
+    text: "go to the microwave, then the laptop, then come back"
+    expect: {status: plan, ids: [[315, 330], [32, 92]]}
+  - name: ms_ladder_and_back
+    text: "go to the ladder and then come back"
+    expect: {status: plan, labels: [ladder, back]}
+
+  # ---- things that aren't there / aren't instructions / stop ----
+  - name: nf_swimming_pool
+    text: "go to the swimming pool"
+    known_issue: "a teal tube on the floor (#198) scores 0.42 for 'swimming pool'"
+    expect: {status: not_found}
+  - name: nf_red_car
+    text: "drive to the red car"
+    known_issue: "a reddish blur (#245) scores 0.24 for 'red car'"
+    expect: {status: not_found}
+  - name: nu_joke
+    text: "tell me a joke"
+    expect: {status: not_understood}
+  - name: nu_numbers
+    text: "12345"
+    expect: {status: not_understood}
+  - name: stop_halt
+    text: "halt"
+    expect: {status: stopped}
+  - name: stop_please_now
+    text: "please stop now"
+    expect: {status: stopped}
 
   # ---- drive-level (first cut; see the artifact's Evals tab for the criteria and known gaps) ----
   - name: drive_ladder

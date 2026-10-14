@@ -13,10 +13,14 @@ CASES = yaml.safe_load(open(os.path.join(HERE, "..", "tools", "nlnav_eval", "cas
 
 def test_cases_file_is_well_formed():
     names = [c["name"] for c in CASES["cases"]]
-    assert len(names) == len(set(names)) and len(names) >= 11
+    assert len(names) == len(set(names)) and len(names) >= 30
     for c in CASES["cases"]:
         assert c["text"] and c["expect"]["status"] in ("plan", "not_found", "not_understood", "stopped", "error", "done", "canceled")
     assert sum(1 for c in CASES["cases"] if c.get("drive")) >= 3
+    rels = {w for c in CASES["cases"] for w in ("left", "right", "front", "behind", "near", "next to") if w in c["text"]}
+    assert {"left", "right", "front", "behind", "near"} <= rels            # every relation word has a case
+    for c in CASES["cases"]:
+        assert isinstance(c.get("known_issue", ""), str)
 
 
 def plan(*labels, ids=None, xy=(0.0, 0.0)):
@@ -65,3 +69,12 @@ def test_judge_fails_infrastructure_outcomes_cleanly():
                   {"status": "done", "near_id": 28, "near_m": 3.2}, {"status": "canceled", "stop_after_s": 4}):
             ok, why = judge(e, att, {28: (0.0, 0.0)})
             assert not ok and status in why
+
+
+def test_judge_localization_scaffold():
+    """max_loc_err_m (AMCL vs ground truth): pass within the limit, fail beyond it or with no samples."""
+    e = {"status": "done", "max_loc_err_m": 0.3}
+    base = {"status": "done", "items": []}
+    assert judge(e, dict(base, loc_err_max_m=0.12))[0]
+    assert not judge(e, dict(base, loc_err_max_m=0.5))[0]
+    assert not judge(e, base)[0]

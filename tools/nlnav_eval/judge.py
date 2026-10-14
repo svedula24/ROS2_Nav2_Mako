@@ -79,4 +79,11 @@ def judge(expect: dict, attempt: dict, objects: dict = None):
         return False, f"nav2 pose froze (footprint age {attempt['max_footprint_age_s']:.1f} s)"
     if attempt.get("failsafe"):
         return False, f"commander failsafe: {attempt['failsafe']}"
+    if "max_loc_err_m" in expect:                       # SCAFFOLD: localization (AMCL) vs ground truth
+        err = attempt.get("loc_err_max_m")
+        if err is None:
+            return False, "no localization samples (TF map->base_link vs /odom_true)"
+        if err > expect["max_loc_err_m"]:
+            return False, f"localization off by {err:.2f} m (limit {expect['max_loc_err_m']})"
+        why.append(f"localized within {err:.2f} m")
     return True, "; ".join(why) or "ok"

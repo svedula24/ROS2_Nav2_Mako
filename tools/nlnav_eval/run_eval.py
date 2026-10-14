@@ -22,6 +22,8 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PolygonStamped
 from m20_msgs.action import NavigateNL
@@ -72,6 +74,12 @@ class Eval(Node):
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.client = ActionClient(self, NavigateNL, "/m20/nlnav/navigate")
         self.set_mode = self.create_client(SetMode, "/m20/set_mode")
+        # localization check (SCAFFOLD for AMCL vs ground truth): the pose the stack BELIEVES (TF map->base_link,
+        # which Nav2 plans from) against /odom_true at the same stamp. With ground-truth localization the two are
+        # the same by construction (error 0); with AMCL this becomes the localization error during every drive.
+        self.tf = Buffer()
+        self._tfl = TransformListener(self.tf, self)
+        self.loc_err, self.loc_yaw_err, self.loc_n = 0.0, 0.0, 0
 
     def on_odom(self, m):
         r, p, y = rpy(m.pose.pose.orientation)
@@ -79,6 +87,22 @@ class Eval(Node):
             self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, y, r, p, time.time())
             if self.watch:
                 self.max_tilt = max(self.max_tilt, abs(r), abs(p))
+        if self.watch:
+            self._sample_localization(m, y)
+
+    def _sample_localization(self, m, true_yaw):
+        try:
+            t = self.tf.lookup_transform("map", "base_link", Time.from_msg(m.header.stamp))
+        except Exception:
+            return                                            # TF not at that stamp yet: skip this sample
+        dx = t.transform.translation.x - m.pose.pose.position.x
+        dy = t.transform.translation.y - m.pose.pose.position.y
+        dyaw = rpy(t.transform.rotation)[2] - true_yaw
+        dyaw = math.degrees(math.atan2(math.sin(dyaw), math.cos(dyaw)))   # wrap to [-180, 180]
+        with self.lock:
+            self.loc_err = max(self.loc_err, math.hypot(dx, dy))
+            self.loc_yaw_err = max(self.loc_yaw_err, abs(dyaw))
+            self.loc_n += 1
 
     def on_fp(self, costmap, m):
         """Staleness = how long the footprint's stamp has NOT advanced, timed on this process's monotonic clock
@@ -105,12 +129,17 @@ class Eval(Node):
     def start_watch(self):
         with self.lock:
             self.watch, self.max_tilt, self.fp_age_max, self.failsafe = True, 0.0, 0.0, ""
+            self.loc_err, self.loc_yaw_err, self.loc_n = 0.0, 0.0, 0
 
     def stop_watch(self):
         with self.lock:
             self.watch = False
             age = max(self.fp_age_max, self._fp_staleness_now())
-            return {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe}
+            out = {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe}
+            if self.loc_n:
+                out.update(loc_err_max_m=round(self.loc_err, 3), loc_yaw_err_max_deg=round(self.loc_yaw_err, 2),
+                           loc_samples=self.loc_n)
+            return out
 
     def xy(self):
         with self.lock:
@@ -245,6 +274,8 @@ def main():
 
     for c in cases:
         rec = {"name": c["name"], "text": c["text"], "expect": c["expect"], "attempts": []}
+        if c.get("known_issue"):
+            rec["known_issue"] = c["known_issue"]
         for k in range(a.repeat):
             att = {"t_start": time.time()}           # wall clock on purpose: joined to the node's log stamps
             if a.drive and not reset_robot(node, start):

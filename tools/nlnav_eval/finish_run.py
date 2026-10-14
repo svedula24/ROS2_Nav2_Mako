@@ -28,13 +28,26 @@ def med(xs):
     return f"{statistics.median(xs):.0f}" if xs else "-"
 
 
+def verdict(c):
+    ok = all(a["pass"] for a in c["attempts"])
+    if c.get("known_issue"):
+        return "FIXED?" if ok else "KNOWN"          # a known issue that now passes deserves a look (and the key removed)
+    return "PASS" if ok else "FAIL"
+
+
 print(f"\n{run['tag']}  ({run['ts']}, {'drive' if run.get('drive') else 'plan'}-level, config {run.get('config')})")
-print(f"{'case':<26} {'pass':<5} {'status':<14} {'total ms':>9} {'llm ms':>7} {'resolve':>8}  note")
+print(f"{'case':<32} {'result':<6} {'status':<14} {'total ms':>9} {'llm ms':>7} {'resolve':>8}  note")
 for c in run["cases"]:
     att = c["attempts"]
-    ok = all(a["pass"] for a in att)
-    print(f"{c['name']:<26} {'PASS' if ok else 'FAIL':<5} {att[0]['status']:<14} {med([a.get('latency_ms') for a in att]):>9} "
+    print(f"{c['name']:<32} {verdict(c):<6} {att[0]['status']:<14} {med([a.get('latency_ms') for a in att]):>9} "
           f"{med([(a.get('timing') or {}).get('llm_ms') for a in att]):>7} {med([(a.get('timing') or {}).get('resolve_ms') for a in att]):>8}  {att[-1]['why'][:60]}")
-n = sum(all(a["pass"] for a in c["attempts"]) for c in run["cases"])
-print(f"{n}/{len(run['cases'])} pass; median total {med([a.get('latency_ms') for c in run['cases'] for a in c['attempts']])} ms, "
+    loc = [a.get("loc_err_max_m") for a in att if a.get("loc_err_max_m") is not None]
+    if loc:
+        print(f"{'':<32} localization: max error {max(loc):.2f} m, yaw {max(a.get('loc_yaw_err_max_deg') or 0 for a in att):.1f} deg "
+              f"(believed pose vs ground truth)")
+v = [verdict(c) for c in run["cases"]]
+known = [c for c in run["cases"] if c.get("known_issue")]
+print(f"{v.count('PASS')}/{len(v) - len(known)} pass (excluding known issues); NEW FAILURES: {v.count('FAIL')}; "
+      f"known issues: {v.count('KNOWN')} still failing, {v.count('FIXED?')} now passing")
+print(f"median total {med([a.get('latency_ms') for c in run['cases'] for a in c['attempts']])} ms, "
       f"llm {med([(a.get('timing') or {}).get('llm_ms') for c in run['cases'] for a in c['attempts']])} ms")
