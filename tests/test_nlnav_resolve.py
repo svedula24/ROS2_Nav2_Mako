@@ -68,6 +68,17 @@ def test_waypoints_start_and_back():
     assert r.steps[0].goal == (0.0, 0.0, 0.0)
 
 
+def test_scene_start_waypoint_overrides_the_default_spawn():
+    # the Godot sim's M20 spawns away from the map origin; its scene yaml names `start`
+    from m20_nlnav.world import Waypoint
+    w = office()
+    w.waypoints["start"] = Waypoint("start", -2.13, 0.35, -1.58)
+    r = run("go back to the start", world=w)
+    assert r.steps[0].goal == (-2.13, 0.35, -1.58)
+    w.waypoints.pop("start")
+    assert run("go home", world=w).steps[0].goal == (0.0, 0.0, 0.0)
+
+
 def test_multi_step_nearest_is_from_previous_goal():
     # "nearest" is measured from the printer goal, not from the robot's current pose
     w = office()

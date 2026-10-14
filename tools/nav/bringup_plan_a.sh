@@ -50,7 +50,15 @@ DOM=42
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL="$HOME/m20_sim/sdk_deploy/src/M20_sdk_deploy/M20_description"
 SCENE="${M20_SCENE:-oil_gas_field.xml}"
-[ -f "$MODEL/m20_mjcf/mjcf/$SCENE" ] || { echo "ERROR: scene $SCENE not installed next to M20.xml (run tools/setup_sim.sh)"; exit 1; }
+# M20_EXTERNAL_SIM=1: the world is an external simulator bridged to ROS (tools/godot/godot_sim_up.sh
+# starts the Godot sim + tools/godot/godot_bridge.py first). No MuJoCo container, no splat camera and no
+# locomotion bridge here: the external bridge publishes the sim topics and takes /cmd_vel itself.
+EXTERNAL_SIM="${M20_EXTERNAL_SIM:-0}"
+if [ "$EXTERNAL_SIM" = "1" ]; then
+  [ "${M20_STANDUP:-0}" != "1" ] || { echo "ERROR: M20_STANDUP needs the MuJoCo sim (joint-level PD); not with M20_EXTERNAL_SIM"; exit 1; }
+else
+  [ -f "$MODEL/m20_mjcf/mjcf/$SCENE" ] || { echo "ERROR: scene $SCENE not installed next to M20.xml (run tools/setup_sim.sh)"; exit 1; }
+fi
 if [ "$SCENE" != "oil_gas_field.xml" ]; then
   # the only pre-built map and the default goal both belong to the oil & gas field
   [ -z "${M20_STATIC_MAP:-}" ] || { echo "ERROR: M20_STATIC_MAP is an oil_gas_field map; $SCENE runs live SLAM only"; exit 1; }
@@ -168,8 +176,62 @@ print(f"  patched: max_vel_x={v}, accel {acc}/-1.5, footprint 0.86x0.56 +0.10, i
 PYEOF
 fi
 
+if [ "$EXTERNAL_SIM" = "1" ]; then
+  # External (Godot) sim: its lidars only look UP from ~0.45 m, so low obstacles come from the
+  # depth camera (/camera/obstacle_points, tools/godot/godot_bridge.py). They get their OWN
+  # obstacle layer: in the lidar's layer, every upward lidar beam projected into /scan would
+  # raytrace-clear the low obstacle it passes over (measured: the robot drove into furniture).
+  # Here only the camera's own view clears its cells. Heights are base_link z (odom z = 0).
+  # M20_SITE_MAP=<repo path without extension> (tools/godot/site_map.py output): the site's known map.
+  # map_server serves it (step 4) and the global costmap plans on the WHOLE site from t=0 (static layer)
+  # instead of only what the sensors have seen, the main cause of getting boxed in among furniture.
+  if [ -n "${M20_SITE_MAP:-}" ]; then
+    [ -f "$REPO/$M20_SITE_MAP.yaml" ] || { echo "ERROR: site map $M20_SITE_MAP.yaml not found (run tools/godot/site_map.py)"; exit 1; }
+    echo "[1.65/7] external sim: site map $(basename "$M20_SITE_MAP") -> global costmap static layer"
+    docker exec $C bash -lc "mkdir -p /cfg/maps && rm -f /cfg/maps/site.*"
+    docker cp "$REPO/$M20_SITE_MAP.pgm" $C:/cfg/maps/$(basename "$M20_SITE_MAP").pgm
+    docker cp "$REPO/$M20_SITE_MAP.yaml" $C:/cfg/maps/site.yaml
+    docker exec -i $C python3 - <<'PYEOF'
+import yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+g = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
+g["rolling_window"] = False
+g.pop("width", None); g.pop("height", None)
+g["track_unknown_space"] = True
+g["plugins"] = ["static_layer", "obstacle_layer", "inflation_layer"]
+g["static_layer"] = {"plugin": "nav2_costmap_2d::StaticLayer", "map_subscribe_transient_local": True,
+                     "map_topic": "/map"}
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched: global costmap = static site map + lidar + inflation (full site, non-rolling)")
+PYEOF
+  fi
+  echo "[1.7/7] external sim: depth-camera obstacle layer in both costmaps"
+  docker exec -i $C python3 - <<'PYEOF'
+import yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+for k in ("global_costmap", "local_costmap"):
+    cm = cfg[k][k]["ros__parameters"]
+    if "camera_layer" not in cm["plugins"]:
+        cm["plugins"].insert(cm["plugins"].index("inflation_layer"), "camera_layer")
+    cm["camera_layer"] = {
+        "plugin": "nav2_costmap_2d::ObstacleLayer", "enabled": True, "observation_sources": "camera",
+        "camera": {"topic": "/camera/obstacle_points", "data_type": "PointCloud2",
+                   "sensor_frame": "camera_optical_link", "marking": True, "clearing": True,
+                   "min_obstacle_height": -0.36, "max_obstacle_height": 0.54,
+                   "obstacle_max_range": 4.0, "raytrace_max_range": 4.5, "raytrace_min_range": 0.0,
+                   "expected_update_rate": 0.0}}
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched: camera_layer (PointCloud2 /camera/obstacle_points) in global + local costmaps")
+PYEOF
+fi
+
 # the splat camera replaces the MuJoCo camera (one /camera/image_raw publisher)
 SIM_CAMERA="${M20_CAMERA:-0}"; [ "${M20_SPLAT_CAMERA:-0}" = "1" ] && SIM_CAMERA=0
+if [ "$EXTERNAL_SIM" = "1" ]; then
+  echo "[2/7] external sim: world, sensors and drive come from its ROS bridge (no MuJoCo container)"
+else
 echo "[2/7] starting MuJoCo sim (${SCENE%.xml}, headless, start=$([ "${M20_STANDUP:-0}" = 1 ] && echo folded || echo stand))"
 docker rm -f m20_sim_run 2>/dev/null || true
 docker run -d --name m20_sim_run --network host --ipc host \
@@ -181,8 +243,9 @@ docker run -d --name m20_sim_run --network host --ipc host \
   -v "$MODEL":/model:ro -v "$REPO/tools/mujoco_sim.py":/mujoco_sim.py:ro \
   m20_sim:latest python3 /mujoco_sim.py
 sleep 8
+fi
 
-if [ "${M20_SPLAT_CAMERA:-0}" = "1" ]; then
+if [ "${M20_SPLAT_CAMERA:-0}" = "1" ] && [ "$EXTERNAL_SIM" != "1" ]; then
   SCENE_YAML="$REPO/tools/sim/${SCENE%.xml}.scene.yaml"
   [ -f "$SCENE_YAML" ] || { echo "ERROR: M20_SPLAT_CAMERA=1 but $SCENE has no scene yaml (not a splat world)"; exit 1; }
   SPLAT_FILE=$(awk '/^  file:/{print $2; exit}' "$SCENE_YAML")
@@ -259,9 +322,13 @@ PYEOF" | tail -1)
   sleep 4
   docker exec $C bash -lc "$SRC; ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: 3, requester: bringup_standup}'" | tail -2
 else
-  echo "[3/7] starting bridge (sim backend) + arming"
-  docker exec -d $C bash -lc "$SRC; python3 /cfg/bridge_node.py --ros-args -p sdk_backend:=sim"
-  sleep 4
+  if [ "$EXTERNAL_SIM" = "1" ]; then
+    echo "[3/7] arming (the external sim's bridge takes /cmd_vel; no locomotion bridge)"
+  else
+    echo "[3/7] starting bridge (sim backend) + arming"
+    docker exec -d $C bash -lc "$SRC; python3 /cfg/bridge_node.py --ros-args -p sdk_backend:=sim"
+    sleep 4
+  fi
   docker exec $C bash -lc "$SRC; ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: 1, requester: nav_test}'" | tail -2
 fi
 
@@ -301,6 +368,12 @@ elif [ "${M20_GT_LOC:-0}" = "1" ]; then
   # still come from the live LiDAR (rolling costmaps). NOT for gates / evidence runs.
   echo "[4/7] GROUND-TRUTH localization (demo only): static map->odom, no slam_toolbox"
   docker exec -d $C bash -lc "$SRC; ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0 --frame-id map --child-frame-id odom"
+  if [ -n "${M20_SITE_MAP:-}" ] && [ "$EXTERNAL_SIM" = "1" ]; then
+    echo "[4.1/7] map_server: site map on /map (transient local) + its lifecycle manager"
+    docker exec -d $C bash -lc "$SRC; ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=/cfg/maps/site.yaml -p use_sim_time:=false >/cfg/out/map_server.log 2>&1"
+    docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_map -p autostart:=true -p node_names:=\"['map_server']\" >/cfg/out/map_lifecycle.log 2>&1"
+    sleep 3
+  fi
 else
   echo "[4/7] starting slam_toolbox (mapping)"
   docker exec -d $C bash -lc "$SRC; ros2 run slam_toolbox async_slam_toolbox_node --ros-args --params-file /cfg/mapper_params.yaml >/cfg/out/slam.log 2>&1"

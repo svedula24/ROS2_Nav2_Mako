@@ -79,7 +79,10 @@ def resolve(cmd: Command, world: World, pick_id: int = -1) -> Resolution:
     shown: List[Candidate] = []
     for t in cmd.steps:
         if t.kind == "start":
-            g = world.start
+            # a scene's own `start` waypoint wins over the default spawn (the Godot sim's M20
+            # does not spawn at the map origin)
+            wp = world.waypoints.get("start")
+            g = (wp.x, wp.y, wp.yaw if wp.yaw is not None else 0.0) if wp else world.start
             steps.append(Step("start", (g[0], g[1], g[2])))
         elif t.kind == "back":
             if start_here is None:

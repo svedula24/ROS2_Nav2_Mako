@@ -61,6 +61,7 @@ if [ "${M20_DETECT:-1}" = "1" ]; then
   docker rm -f m20_detector >/dev/null 2>&1 || true
   docker run -d --name m20_detector --gpus all --network host --ipc host \
     -e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -v "$REPO/tools/splat":/splat_tools:ro \
     m20_splat:latest python3 -u /splat_tools/detector_node.py >/dev/null
 fi
