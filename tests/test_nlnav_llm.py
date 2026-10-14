@@ -18,7 +18,6 @@ def test_validate_accepts_the_artifact_examples():
     None, {}, {"steps": "ladder", "stop": False}, {"steps": [], "stop": False},
     {"steps": [{"target": "", "pick": "best"}], "stop": False},
     {"steps": [{"target": "valve", "relation": "above", "anchor": "pump", "pick": "best"}], "stop": False},
-    {"steps": [{"target": "valve", "relation": "near", "pick": "best"}], "stop": False},     # no anchor
     {"steps": [{"target": "valve", "pick": "random"}], "stop": False},
     {"understood": False, "steps": [{"target": "back", "pick": "best"}], "stop": False},   # gibberish, model guessed
 ])
@@ -75,3 +74,11 @@ def test_understood_flag_is_optional_and_true_passes():
     assert llm.validate({"understood": True, "steps": [{"target": "ladder", "pick": "best"}], "stop": False})
     assert llm.validate({"understood": False, "steps": [], "stop": True}).stop     # "stop" always wins
     assert list(llm.SCHEMA["properties"])[0] == "understood"                        # decided before the steps
+
+
+def test_relation_without_anchor_is_dropped_not_rejected():
+    """qwen2.5:3b answers "the nearest trash can" with relation "near" and no anchor; the step is still a valid
+    target, so the meaningless relation goes and the query stands (found by tools/nlnav_eval, 2026-10-14)."""
+    q = llm.validate({"understood": True, "steps": [{"target": "trash can", "anchor": None, "relation": "near",
+                                                     "pick": "nearest"}], "stop": False})
+    assert q.steps[0].target == "trash can" and q.steps[0].relation is None and q.steps[0].pick == "nearest"

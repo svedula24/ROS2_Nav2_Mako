@@ -71,3 +71,17 @@ def test_place_picks_the_object_not_the_wall_behind_it():
     assert abs(centre[2] - 2.0) < 0.05                        # z (optical depth) is the object's
     assert size[2] < 0.3                                      # not smeared to the wall
     assert place(np.zeros((480, 640), np.float32), box, K, T) is None
+
+
+def test_confident_relabels_low_scores_and_can_drop():
+    from dataclasses import replace
+    from m20_nlnav.object_map import MapObject, ObjectMap
+    import numpy as np
+    e = np.zeros(512, np.float32); e[0] = 1.0
+    base = MapObject(1, "refrigerator", (0.0, 0.0, 0.5), (0.5, 0.5, 1.0), e, -0.5, 10.0, 0.13, 3, 0.0, 0.13)
+    m = ObjectMap([base, replace(base, id=2, label="ladder", score=0.9), replace(base, id=3, label="object", score=0.2)])
+    c = m.confident(min_label=0.4)
+    assert [o.label for o in c.objects] == ["object", "ladder", "object"]
+    assert np.array_equal(c.objects[0].emb, e) and c.objects[0].score == 0.13      # embedding/score untouched
+    assert m.objects[0].label == "refrigerator"                                     # original map unchanged
+    assert [o.id for o in m.confident(min_label=0.4, min_keep=0.15).objects] == [2, 3]

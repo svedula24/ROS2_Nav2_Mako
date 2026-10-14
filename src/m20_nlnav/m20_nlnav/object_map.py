@@ -26,7 +26,7 @@ so any phrase, including ones nobody listed at mapping time, gets an OWLv2-calib
 import base64
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 import numpy as np
@@ -107,6 +107,19 @@ class ObjectMap:
             raise ValueError(f"object map version {d.get('version')} != {VERSION}")
         return ObjectMap([MapObject.from_json(o) for o in d["objects"]], d.get("site", ""), d.get("frame", "map"),
                          d.get("built", ""), d.get("embedding", ""))
+
+    def confident(self, min_label: float = 0.4, min_keep: float = 0.0):
+        """A copy keeping objects with score >= min_keep; those below min_label keep their embedding (still
+        matchable by any phrase) but are relabeled "object": the detector's word is unreliable at low score
+        (circuit4: 22 "refrigerators" that were white cabinets), the embedding much less so."""
+        objs = []
+        for o in self.objects:
+            if o.score < min_keep:
+                continue
+            if o.score < min_label and o.label != "object":
+                o = replace(o, label="object")
+            objs.append(o)
+        return ObjectMap(objs, self.site, self.frame, self.built, self.embedding)
 
     def matrix(self):
         """-> (E (n,512), shift (n,), scale (n,)) for vectorised scoring."""

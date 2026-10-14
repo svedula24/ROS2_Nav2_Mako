@@ -54,11 +54,15 @@ class NLNavNode(Node):
                               ("costmap_topic", "/global_costmap/costmap"),
                               ("costmap_service", "/global_costmap/get_costmap"),
                               ("llm", os.environ.get("NLNAV_LLM", "ollama")), ("text_encoder", "owl"),
-                              ("threshold", 0.10), ("reach_check", True)):
+                              ("threshold", 0.10), ("reach_check", True),
+                              ("min_label_score", 0.4), ("min_object_score", 0.0)):
             self.declare_parameter(name, default)
         p = lambda n: self.get_parameter(n).value
         self.scene_yaml, self.map_path = p("scene_yaml"), p("object_map")
         self.threshold, self.reach_check = float(p("threshold")), bool(p("reach_check"))
+        # confident labels only: below min_label_score the word becomes "object" (embedding kept); below
+        # min_object_score the object is dropped. See ObjectMap.confident.
+        self.min_label_score, self.min_object_score = float(p("min_label_score")), float(p("min_object_score"))
         self.backend = llm.make_backend(p("llm"))
         self.encoder_kind, self._encoder, self.enc_lock = p("text_encoder"), None, threading.Lock()
 
@@ -137,9 +141,12 @@ class NLNavNode(Node):
             return
         mt = os.path.getmtime(self.map_path)
         if mt != self.map_mtime:
-            self.omap = ObjectMap.load(self.map_path)
+            raw = ObjectMap.load(self.map_path)
+            self.omap = raw.confident(self.min_label_score, self.min_object_score)
             self.map_mtime = mt
-            self.get_logger().info(f"object map: {len(self.omap.objects)} objects ({self.map_path})")
+            labeled = sum(o.label != "object" for o in self.omap.objects)
+            self.get_logger().info(f"object map: {len(self.omap.objects)} of {len(raw.objects)} objects kept, "
+                                   f"{labeled} with a label >= {self.min_label_score} ({self.map_path})")
 
     def encoder(self):
         with self.enc_lock:                    # warm-up thread and a first query may race to load it
@@ -185,7 +192,7 @@ class NLNavNode(Node):
     # ---------- action ----------
     def execute(self, gh):
         req = gh.request
-        t0 = time.time()
+        t0 = time.monotonic()                            # latency: monotonic (WSL steps its wall clock)
         res = NavigateNL.Result()
         res.tier = 1                                           # 1 = LLM-parsed (tier 0 retired)
         self._fb(gh, "resolving")
@@ -207,9 +214,9 @@ class NLNavNode(Node):
                                 detail="stopped" if stopped else "nothing of mine was running")
         with self.lock:
             pose = self.pose
-        t1 = time.time()
+        t1 = time.monotonic()
         grid = self.fetch_grid()
-        t2 = time.time()
+        t2 = time.monotonic()
         try:                                   # e.g. text_encoder:=owl in an image without torch
             r = semantic.resolve(q, self.omap, self.encoder(), self.waypoints, pose=pose, grid=grid,
                                  threshold=self.threshold, pick_id=req.pick_id,
@@ -218,7 +225,7 @@ class NLNavNode(Node):
             self.get_logger().error(f"resolve failed: {type(e).__name__}: {e}")
             return self._finish(gh, res, t0, "error", detail=f"resolver failed ({type(e).__name__}: {e})")
         self.get_logger().info(f"timing: llm {1e3 * (t1 - t0):.0f} ms, costmap {1e3 * (t2 - t1):.0f} ms, "
-                               f"resolve+reach {1e3 * (time.time() - t2):.0f} ms")
+                               f"resolve+reach {1e3 * (time.monotonic() - t2):.0f} ms")
         res.interpretation = r.interpretation
         res.candidates = [self._cand(c) for c in r.candidates]
         res.items = [self._item(s) for s in r.steps]
@@ -228,7 +235,7 @@ class NLNavNode(Node):
         if req.dry_run:
             return self._finish(gh, res, t0, "plan", success=True,
                                 detail=("dry run: not driving" + (f"; {r.detail}" if r.detail else "")))
-        res.latency_ms = 1e3 * (time.time() - t0)
+        res.latency_ms = 1e3 * (time.monotonic() - t0)
         res.detail = r.detail
         return self._drive(gh, res)
 
@@ -281,7 +288,7 @@ class NLNavNode(Node):
     def _finish(self, gh, res, t0, status, success=False, detail=""):
         res.status, res.success, res.detail = status, success, detail
         if t0 is not None:
-            res.latency_ms = 1e3 * (time.time() - t0)
+            res.latency_ms = 1e3 * (time.monotonic() - t0)
         self.get_logger().info(f"'{gh.request.text}' -> {status}: {res.interpretation or ''} {detail}".strip())
         gh.succeed()
         return res

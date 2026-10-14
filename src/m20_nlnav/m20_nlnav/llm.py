@@ -64,6 +64,9 @@ Examples:
 "the chair to the left of the printer" ->
  {"understood": true, "steps": [{"target": "chair", "anchor": "printer", "relation": "left_of", "pick": "best"}],
   "stop": false}
+"the nearest trash can" (a bare noun phrase IS an instruction: go there) ->
+ {"understood": true, "steps": [{"target": "trash can", "anchor": null, "relation": null, "pick": "nearest"}],
+  "stop": false}
 "blorp" -> {"understood": false, "steps": [], "stop": false}"""
 
 
@@ -122,7 +125,8 @@ def validate(obj) -> Query:
             raise NotUnderstood(f"unknown relation {rel!r}")
         anchor = re.sub(r"^(the|a|an|my)\s+", "", str(anchor).strip().lower()) if anchor else None
         if rel and not anchor:
-            raise NotUnderstood(f"relation {rel!r} without an anchor object")
+            rel = None            # a relation with nothing to relate to carries no information: drop it, keep the
+                                  # step (qwen2.5:3b answers "the nearest trash can" with relation "near", anchor null)
         pick = s.get("pick", "best")
         if pick not in PICKS:
             raise NotUnderstood(f"unknown pick {pick!r}")
