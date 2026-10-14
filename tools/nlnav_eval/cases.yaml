@@ -1,0 +1,68 @@
+# NL-navigation eval cases (tools/nlnav_eval). Plan-level cases run in dry-run from `start_pose`; drive-level
+# cases (`drive: true`) move the robot and run only with eval.sh --drive.
+#
+# expect keys (all optional except status):
+#   status       plan | not_found | not_understood | stopped | error
+#   labels       the label of each step, in order ("start" / "back" for named places)
+#   ids          the object id of each step (-1 / null = don't care for that step)
+#   goal_xy, tol first step's goal must be within tol metres of goal_xy
+#   near_id/near_xy (drive) sanity bound: end within `near_m` of this object's map position / this point; the
+#                real arrival test is <= approach_tol_m (0.6) from the approach pose the planner chose
+#   stop_after_s (drive) send "stop" this many seconds in; expect canceled, roll-out <= max_rollout_m (0.5), then still
+# Site: circuit4 (Godot). Object ids refer to ~/m20_sim/semmap/circuit4/object_map.json built 2026-10-13
+# (229 keyframes, 260 objects). Rebuilding the map renumbers ids: update `ids`/`near_id` then.
+site: circuit4
+start_pose: [-2.13, 0.35, -1.6]        # x, y, yaw (rad): the spawn, facing south
+
+cases:
+  - name: ladder
+    text: "go to the ladder"
+    expect: {status: plan, labels: [ladder], ids: [28], goal_xy: [-2.13, -8.52], tol: 0.6}
+  - name: nearest_trash_can
+    text: "the nearest trash can"
+    expect: {status: plan, labels: [trash can]}
+  - name: desk_near_whiteboard
+    text: "the desk near the whiteboard"
+    expect: {status: plan, labels: [desk], ids: [76]}
+  - name: ladder_then_start
+    text: "go to the ladder then come back to the start"
+    expect: {status: plan, labels: [ladder, start]}
+  - name: fire_extinguisher_paraphrase
+    text: "the thing you use to put out fires"
+    expect: {status: plan, ids: [22]}
+  - name: back_to_start
+    text: "go back to the start"
+    expect: {status: plan, labels: [start]}
+  - name: unicorn_not_found
+    text: "go to the unicorn statue"
+    expect: {status: not_found}
+  - name: gibberish
+    text: "asdf qwerty"
+    expect: {status: not_understood}
+  - name: chit_chat
+    text: "what's the weather like"
+    expect: {status: not_understood}
+  - name: stop_idle
+    text: "stop"
+    expect: {status: stopped}
+  - name: long_valve_sentence
+    text: "head over and find the valve right next to the big yellow tank, and then come back to the dock"
+    expect: {status: not_found}
+
+  # ---- drive-level (first cut; see the artifact's Evals tab for the criteria and known gaps) ----
+  - name: drive_ladder
+    drive: true
+    text: "go to the ladder"
+    expect: {status: done, labels: [ladder], near_id: 28, near_m: 3.2}
+  - name: drive_ladder_then_start
+    drive: true
+    text: "go to the ladder then come back to the start"
+    expect: {status: done, labels: [ladder, start], near_xy: [-2.13, 0.35], near_m: 0.8}
+  - name: drive_nearest_trash_can
+    drive: true
+    text: "the nearest trash can"
+    expect: {status: done, labels: [trash can], near_m: 3.2}
+  - name: drive_stop
+    drive: true
+    text: "go to the ladder"
+    expect: {status: canceled, stop_after_s: 4}
