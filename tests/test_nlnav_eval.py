@@ -34,6 +34,9 @@ def test_judge_plan_level():
     assert judge({"status": "not_found"}, {"status": "not_found", "items": []})[0]
     assert not judge({"status": "not_understood"}, {"status": "plan", "items": []})[0]
     assert judge({"status": "plan", "ids": [20]}, plan("object", ids=[20]))[0]      # label free, id fixed
+    alt = {"status": "plan", "ids": [[261, 264, 266]]}                                # equally right answers
+    assert judge(alt, plan("object", ids=[264]))[0]
+    assert not judge(alt, plan("object", ids=[76]))[0]
 
 
 def test_judge_drive_level():
@@ -51,3 +54,14 @@ def test_judge_drive_level():
     assert judge(stop, {"status": "canceled", "items": [], "stop_drift_m": 0.27, "settle_m": 0.01})[0]
     assert not judge(stop, {"status": "canceled", "items": [], "stop_drift_m": 0.8, "settle_m": 0.01})[0]   # rolled too far
     assert not judge(stop, {"status": "canceled", "items": [], "stop_drift_m": 0.2, "settle_m": 0.3})[0]    # never stopped
+
+
+def test_judge_fails_infrastructure_outcomes_cleanly():
+    """run_eval records a timeout / rejected goal / failed reset in the result's shape; the judge must fail it
+    on status (never crash on the empty items), for every kind of expectation."""
+    for status in ("timeout", "rejected", "reset_failed"):
+        att = {"status": status, "items": [], "candidates": [], "latency_ms": None}
+        for e in ({"status": "plan", "labels": ["ladder"], "ids": [28]}, {"status": "not_found"},
+                  {"status": "done", "near_id": 28, "near_m": 3.2}, {"status": "canceled", "stop_after_s": 4}):
+            ok, why = judge(e, att, {28: (0.0, 0.0)})
+            assert not ok and status in why

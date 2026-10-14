@@ -4,7 +4,7 @@
 # --model restarts the NL container on that Ollama model (tools/godot/nlnav_up.sh) and waits for its warm-up.
 # --drive runs the drive-level cases (moves the robot; ~1 min per case) instead of the plan-level ones.
 # Output: ~/m20_sim/evals/<tag>_<timestamp>.json (+ the table on stdout). Compare runs: compare.py a.json b.json
-set -e
+set -eo pipefail               # a failure inside a pipe (docker exec | ...) must stop the run, not pass silently
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 C=docker-commander-1
 SRC='source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp'
@@ -39,7 +39,7 @@ cfg = {'llm': env.get('NLNAV_LLM'), 'model': env.get('NLNAV_LLM_MODEL'), 'encode
        'git': subprocess.run(['git', '-C', '$REPO', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()}
 print(json.dumps(cfg))")
 echo "[eval] config $CFG"
-docker logs m20_nlnav 2>&1 | grep -E "objects kept|min_label" | tail -1 | sed -E 's/^\[INFO\] \[[0-9.]+\] \[m20_nlnav\]: /[eval] /'
+docker logs m20_nlnav 2>&1 | grep -E "objects kept|min_label" | tail -1 | sed -E 's/^\[INFO\] \[[0-9.]+\] \[m20_nlnav\]: /[eval] /' || true   # informational
 
 # the runner + judge + cases + object map go into the commander (no repo mount there)
 docker exec $C bash -lc "rm -rf /tmp/nlnav_eval && mkdir -p /tmp/nlnav_eval"

@@ -4,13 +4,13 @@
 # expect keys (all optional except status):
 #   status       plan | not_found | not_understood | stopped | error
 #   labels       the label of each step, in order ("start" / "back" for named places)
-#   ids          the object id of each step (-1 / null = don't care for that step)
+#   ids          the object id of each step (-1 / null = don't care; a list = any of these is right)
 #   goal_xy, tol first step's goal must be within tol metres of goal_xy
 #   near_id/near_xy (drive) sanity bound: end within `near_m` of this object's map position / this point; the
 #                real arrival test is <= approach_tol_m (0.6) from the approach pose the planner chose
 #   stop_after_s (drive) send "stop" this many seconds in; expect canceled, roll-out <= max_rollout_m (0.5), then still
-# Site: circuit4 (Godot). Object ids refer to ~/m20_sim/semmap/circuit4/object_map.json built 2026-10-13
-# (229 keyframes, 260 objects). Rebuilding the map renumbers ids: update `ids`/`near_id` then.
+# Site: circuit4 (Godot). Object ids refer to ~/m20_sim/semmap/circuit4/object_map.json rebuilt 2026-10-14
+# from two runs (357 keyframes, 403 objects; full tour coverage). Rebuilding the map renumbers ids: update `ids`/`near_id` then.
 site: circuit4
 start_pose: [-2.13, 0.35, -1.6]        # x, y, yaw (rad): the spawn, facing south
 
@@ -23,13 +23,16 @@ cases:
     expect: {status: plan, labels: [trash can]}
   - name: desk_near_whiteboard
     text: "the desk near the whiteboard"
-    expect: {status: plan, labels: [desk], ids: [76]}
+    # the desks beside the whiteboard on an easel (#256, north end); all three tie, and they are low-confidence
+    # detections (0.33) so they display as "object": pin the ids, not the label
+    expect: {status: plan, ids: [[261, 264, 266]]}
   - name: ladder_then_start
     text: "go to the ladder then come back to the start"
     expect: {status: plan, labels: [ladder, start]}
   - name: fire_extinguisher_paraphrase
     text: "the thing you use to put out fires"
-    expect: {status: plan, ids: [22]}
+    # #313: red wall cabinet with a window (north end), 0.44; before full coverage the best was a red blob (#22)
+    expect: {status: plan, ids: [313]}
   - name: back_to_start
     text: "go back to the start"
     expect: {status: plan, labels: [start]}

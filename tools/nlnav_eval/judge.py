@@ -26,10 +26,11 @@ def judge(expect: dict, attempt: dict, objects: dict = None):
         for k, want in enumerate(expect["ids"]):
             if want in (None, -1):
                 continue
+            ok_ids = set(want) if isinstance(want, (list, tuple)) else {want}   # a list = equally right answers
             if k >= len(items):
                 return False, f"step {k} missing (wanted id {want})"
-            if items[k].get("id") != want:
-                return False, f"step {k} id {items[k].get('id')} != {want}"
+            if items[k].get("id") not in ok_ids:
+                return False, f"step {k} id {items[k].get('id')} not in {sorted(ok_ids)}"
     if "goal_xy" in expect:
         if not items:
             return False, "no goal to check"

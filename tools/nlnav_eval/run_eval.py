@@ -59,10 +59,13 @@ class Eval(Node):
         self.pose = None                      # (x, y, yaw, roll, pitch, t)
         self.max_tilt = 0.0
         self.fp_age_max = 0.0
+        self.fp_last = {}                     # costmap -> (last stamp seen, monotonic time it last advanced)
         self.failsafe = ""
         self.watch = False
         self.create_subscription(Odometry, "/odom_true", self.on_odom, qos_profile_sensor_data)
-        self.create_subscription(PolygonStamped, "/local_costmap/published_footprint", self.on_fp, 10)
+        for k in ("local", "global"):         # both costmaps froze independently on 2026-10-13
+            self.create_subscription(PolygonStamped, f"/{k}_costmap/published_footprint",
+                                     (lambda k: lambda m: self.on_fp(k, m))(k), 10)
         self.create_subscription(FailsafeStatus, "/m20/failsafe", self.on_fs, 10)
         self.mode = None
         self.create_subscription(RobotMode, "/m20/mode", lambda m: setattr(self, "mode", m),
@@ -77,11 +80,21 @@ class Eval(Node):
             if self.watch:
                 self.max_tilt = max(self.max_tilt, abs(r), abs(p))
 
-    def on_fp(self, m):
-        age = time.time() - (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)
+    def on_fp(self, costmap, m):
+        """Staleness = how long the footprint's stamp has NOT advanced, timed on this process's monotonic clock
+        (not wall clock minus stamp: WSL steps its wall clock, which once produced a -499 ms latency)."""
+        stamp, now = (m.header.stamp.sec, m.header.stamp.nanosec), time.monotonic()
         with self.lock:
-            if self.watch:
-                self.fp_age_max = max(self.fp_age_max, age)
+            last = self.fp_last.get(costmap)
+            if last is None or stamp != last[0]:
+                self.fp_last[costmap] = (stamp, now)
+            elif self.watch:
+                self.fp_age_max = max(self.fp_age_max, now - last[1])
+
+    def _fp_staleness_now(self):
+        """Also counts a footprint that stopped arriving altogether (no message = its stamp never advances)."""
+        now = time.monotonic()
+        return max((now - adv for _, adv in self.fp_last.values()), default=0.0)
 
     def on_fs(self, m):
         if m.active:                                          # OR of FS_* flags; 0 = none
@@ -96,34 +109,52 @@ class Eval(Node):
     def stop_watch(self):
         with self.lock:
             self.watch = False
-            return {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": self.fp_age_max, "failsafe": self.failsafe}
+            age = max(self.fp_age_max, self._fp_staleness_now())
+            return {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe}
 
     def xy(self):
         with self.lock:
             return (self.pose[0], self.pose[1]) if self.pose else None
 
     def spin_for(self, secs):
-        t = time.time()
-        while time.time() - t < secs:
+        t = time.monotonic()
+        while time.monotonic() - t < secs:
             rclpy.spin_once(self, timeout_sec=0.05)
 
-    def say(self, text, dry_run, pick=-1, cancel_after=None, feedback=None):
+    def send(self, text, dry_run, pick=-1, timeout_s=10.0):
+        """-> accepted goal handle, or None (no answer within timeout_s, or rejected)."""
         g = NavigateNL.Goal()
         g.text, g.dry_run, g.pick_id = text, dry_run, pick
-        fut = self.client.send_goal_async(g, feedback_callback=feedback)
-        t = time.time()
-        while not fut.done() and time.time() - t < 10:
+        fut = self.client.send_goal_async(g)
+        t = time.monotonic()
+        while not fut.done() and time.monotonic() - t < timeout_s:
             rclpy.spin_once(self, timeout_sec=0.05)
-        gh = fut.result()
-        if gh is None or not gh.accepted:
-            return None, None
+        gh = fut.result() if fut.done() else None
+        return gh if gh is not None and gh.accepted else None
+
+    def wait_result(self, gh, limit_s, grace_s=5.0):
+        """-> the action result, or None if it doesn't finish within limit_s (then cancel ONCE and wait up to
+        grace_s for the cancelled result, which is also returned as None: the attempt timed out either way)."""
         res_f = gh.get_result_async()
-        t0 = time.time()
-        while not res_f.done():
+        t = time.monotonic()
+        while not res_f.done() and time.monotonic() - t < limit_s:
             rclpy.spin_once(self, timeout_sec=0.05)
-            if time.time() - t0 > 600:
-                gh.cancel_goal_async()
-        return res_f.result().result, time.time() - t0
+        if res_f.done():
+            return res_f.result().result
+        gh.cancel_goal_async()
+        t = time.monotonic()
+        while not res_f.done() and time.monotonic() - t < grace_s:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return None
+
+    def say(self, text, dry_run, pick=-1, limit_s=600.0):
+        """-> (result | None, wall_s, outcome) with outcome "ok" | "rejected" | "timeout"."""
+        t0 = time.monotonic()
+        gh = self.send(text, dry_run, pick)
+        if gh is None:
+            return None, time.monotonic() - t0, "rejected"
+        r = self.wait_result(gh, limit_s)
+        return r, time.monotonic() - t0, ("ok" if r is not None else "timeout")
 
     def arm(self):
         """Make sure the commander will accept missions: leave an armed robot alone; otherwise ask for ASSISTED
@@ -134,8 +165,8 @@ class Eval(Node):
             return "no set_mode service"
         req = SetMode.Request(); req.mode, req.requester = 2, "nlnav_eval"       # 2 = ASSISTED
         f = self.set_mode.call_async(req)
-        t = time.time()
-        while not f.done() and time.time() - t < 5:
+        t = time.monotonic()
+        while not f.done() and time.monotonic() - t < 5:
             rclpy.spin_once(self, timeout_sec=0.05)
         if not f.done():
             return "set_mode timeout"
@@ -156,14 +187,22 @@ def result_dict(r, wall):
             "candidates": cands, "latency_ms": round(float(r.latency_ms), 1), "detail": r.detail, "wall_s": round(wall, 2)}
 
 
+def failed_attempt(status, detail):
+    """Same shape as a real result, so the judge fails it on status and the report stays uniform."""
+    return {"status": status, "success": False, "interpretation": "", "items": [], "candidates": [],
+            "latency_ms": None, "detail": detail}
+
+
 def reset_robot(node, start):
+    """-> True once the ground-truth pose is within 0.3 m of the start (up to 10 s), else False."""
     sim({"cmd": "reset"})
     for _ in range(100):                                      # wait for the GT pose to show the spawn
         node.spin_for(0.1)
         xy = node.xy()
         if xy and math.hypot(xy[0] - start[0], xy[1] - start[1]) < 0.3:
-            break
-    node.spin_for(1.0)
+            node.spin_for(1.0)
+            return True
+    return False
 
 
 def main():
@@ -196,7 +235,8 @@ def main():
     run = {"tag": a.tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "drive": a.drive, "config": json.loads(a.config),
            "start_pose": start, "cases": []}
     print(f"[eval] {len(cases)} {'drive' if a.drive else 'plan'}-level cases x{a.repeat}; resetting the robot to the spawn")
-    reset_robot(node, start)
+    if not reset_robot(node, start):
+        print(f"[eval] WARNING: the robot did not reach the start pose {start[:2]}; plan cases depend on it")
     if a.drive:
         armed = node.arm()
         print("[eval] arm:", armed)
@@ -206,53 +246,46 @@ def main():
     for c in cases:
         rec = {"name": c["name"], "text": c["text"], "expect": c["expect"], "attempts": []}
         for k in range(a.repeat):
-            att = {"t_start": time.time()}
-            if a.drive:
-                reset_robot(node, start)
+            att = {"t_start": time.time()}           # wall clock on purpose: joined to the node's log stamps
+            if a.drive and not reset_robot(node, start):
+                att.update(failed_attempt("reset_failed", f"robot did not reach the start pose {start[:2]}"))
+            elif a.drive:
                 node.spin_for(0.5)
                 node.start_watch()
                 stop_after = c["expect"].get("stop_after_s")
                 if stop_after:
                     # send the command; after stop_after_s send "stop" as a second goal (the node cancels the
                     # running mission); the first goal then returns canceled. Drift is measured over the next 2 s.
-                    t0 = time.time()
-                    g = NavigateNL.Goal(); g.text, g.dry_run, g.pick_id = c["text"], False, -1
-                    fut = node.client.send_goal_async(g)
-                    while not fut.done():
-                        rclpy.spin_once(node, timeout_sec=0.05)
-                    gh = fut.result()
-                    res_f = gh.get_result_async()
-                    while time.time() - t0 < stop_after:
-                        rclpy.spin_once(node, timeout_sec=0.05)
-                    xy_at_stop = node.xy()
-                    r2, _ = node.say("stop", False)
-                    while not res_f.done():
-                        rclpy.spin_once(node, timeout_sec=0.05)
-                    r = res_f.result().result
-                    node.spin_for(2.0)
-                    xy_after = node.xy()                     # roll-out: stop command -> +2 s
-                    node.spin_for(1.0)
-                    xy_settle = node.xy()                    # +2 s -> +3 s: must be still
-                    att.update(result_dict(r, time.time() - t0))
-                    att["stop_result"] = r2.status if r2 else None
-                    att["stop_drift_m"] = round(math.hypot(xy_after[0] - xy_at_stop[0], xy_after[1] - xy_at_stop[1]), 3) if xy_at_stop and xy_after else None
-                    att["settle_m"] = round(math.hypot(xy_settle[0] - xy_after[0], xy_settle[1] - xy_after[1]), 3) if xy_after and xy_settle else None
-                else:
-                    r, wall = node.say(c["text"], False)
-                    if r is None:
-                        att.update({"status": "rejected", "items": [], "candidates": [], "latency_ms": None, "detail": "goal rejected"})
+                    t0 = time.monotonic()
+                    gh = node.send(c["text"], False)
+                    if gh is None:
+                        att.update(failed_attempt("rejected", "command goal rejected or unanswered"))
                     else:
-                        att.update(result_dict(r, wall))
+                        node.spin_for(max(0.0, stop_after - (time.monotonic() - t0)))
+                        xy_at_stop = node.xy()
+                        r2, _, out2 = node.say("stop", False, limit_s=30.0)
+                        r = node.wait_result(gh, limit_s=60.0)      # the stopped mission must end promptly
+                        if r is None:
+                            att.update(failed_attempt("timeout", "command still running 60 s after stop"))
+                        else:
+                            node.spin_for(2.0)
+                            xy_after = node.xy()                     # roll-out: stop command -> +2 s
+                            node.spin_for(1.0)
+                            xy_settle = node.xy()                    # +2 s -> +3 s: must be still
+                            att.update(result_dict(r, time.monotonic() - t0))
+                            att["stop_drift_m"] = round(math.hypot(xy_after[0] - xy_at_stop[0], xy_after[1] - xy_at_stop[1]), 3) if xy_at_stop and xy_after else None
+                            att["settle_m"] = round(math.hypot(xy_settle[0] - xy_after[0], xy_settle[1] - xy_after[1]), 3) if xy_after and xy_settle else None
+                        att["stop_result"] = r2.status if r2 is not None else out2
+                else:
+                    r, wall, out = node.say(c["text"], False)
+                    att.update(result_dict(r, wall) if r is not None else failed_attempt(out, f"command goal {out}"))
                 node.spin_for(0.5)
                 att.update(node.stop_watch())
                 xy = node.xy()
                 att["final_xy"] = [round(xy[0], 3), round(xy[1], 3)] if xy else None
             else:
-                r, wall = node.say(c["text"], True)
-                if r is None:
-                    att.update({"status": "rejected", "items": [], "candidates": [], "latency_ms": None, "detail": "goal rejected"})
-                else:
-                    att.update(result_dict(r, wall))
+                r, wall, out = node.say(c["text"], True, limit_s=60.0)
+                att.update(result_dict(r, wall) if r is not None else failed_attempt(out, f"dry-run goal {out}"))
             att["t_end"] = time.time()
             att["pass"], att["why"] = judge(c["expect"], att, objects)
             rec["attempts"].append(att)
