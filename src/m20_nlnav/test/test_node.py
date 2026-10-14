@@ -1,9 +1,10 @@
-"""ROS-level test of nlnav_node (real rclpy; run by `colcon test` in the CI image).
+"""ROS-level test of nlnav_node, offline phase (real rclpy; run by `colcon test` in the CI image).
 
-Fixture world on real topics (object map JSON, odometry, an all-free costmap), a scene yaml with
-waypoints, and a FAKE RunMission server standing in for m20_missions. Checks the NavigateNL
-contract end to end: plan / not_found / dry run / explicit pick, driving through RunMission, and cancel
-forwarding.
+Fixture world: an object map FILE (format v1, label embeddings), a scene yaml with named places, odometry
+and an all-free costmap on real topics, and a FAKE RunMission server standing in for m20_missions. The LLM
+is the JSON passthrough backend (the instruction IS the structured query) and the text encoder is the
+torch-free label encoder, so no model or network is needed. Checks the NavigateNL contract end to end:
+plan / not_found / not_understood / dry run, driving through RunMission, stop, and cancel forwarding.
 """
 import json
 import os
@@ -20,16 +21,25 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
 from nav_msgs.msg import OccupancyGrid, Odometry
-from std_msgs.msg import String
 from m20_msgs.action import NavigateNL, RunMission
 
 from m20_nlnav.nlnav_node import NLNavNode
+from m20_nlnav.object_map import MapObject, ObjectMap
+from m20_nlnav.semantic import label_embedding
 
-OBJECTS = {"frame": [], "objects": [
-    {"id": 1, "cls": "printer", "xyz": [4.0, 0.0, 0.5], "n": 9, "score": 0.82, "size": [0.6, 0.5, 1.0]},
-    {"id": 2, "cls": "office chair", "xyz": [2.0, 3.0, 0.5], "n": 6, "score": 0.71, "size": [0.6, 0.6, 1.0]},
-    {"id": 3, "cls": "office chair", "xyz": [-3.0, 1.0, 0.5], "n": 8, "score": 0.90, "size": [0.6, 0.6, 1.0]},
-]}
+
+def mo(i, label, x, y):
+    return MapObject(i, label, (x, y, 0.5), (0.6, 0.5, 1.0), label_embedding(label), -0.5, 10.0, 0.8, 5, 0.0, 0.8)
+
+
+OBJECTS = [mo(1, "printer", 4.0, 0.0), mo(2, "office chair", 2.0, 3.0), mo(3, "office chair", -3.0, 1.0),
+           mo(4, "whiteboard", 2.0, 5.0)]
+
+
+def Q(*targets, stop=False, **kw):
+    """A structured query as the JSON backend expects it."""
+    steps = [dict({"target": t, "pick": "best"}, **kw) for t in targets]
+    return json.dumps({"steps": steps, "stop": stop})
 
 
 class FakeMission(Node):
@@ -65,16 +75,18 @@ class FakeMission(Node):
 
 @pytest.fixture(scope="module")
 def stack():
-    scene = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    scene.write("waypoints:\n  start: [0.0, 0.0, 0.0]\n  stop 3: [0.8, -8.1]\n")
-    scene.close()
-    rclpy.init(args=["--ros-args", "-p", f"scene_yaml:={scene.name}"])
+    tmp = tempfile.mkdtemp()
+    scene = os.path.join(tmp, "scene.yaml")
+    open(scene, "w").write("waypoints:\n  start: [0.0, 0.0, 0.0]\n  dock: [0.8, -8.1]\n")
+    omap = os.path.join(tmp, "object_map.json")
+    ObjectMap(OBJECTS, site="test").save(omap)
+    rclpy.init(args=["--ros-args", "-p", f"scene_yaml:={scene}", "-p", f"object_map:={omap}",
+                     "-p", "llm:=json", "-p", "text_encoder:=label", "-p", "reach_check:=false"])
     nl = NLNavNode()
     fake = FakeMission()
     io = Node("fixture_io")
     latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                          reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
-    pub_obj = io.create_publisher(String, "/detections/objects", 10)
     pub_odom = io.create_publisher(Odometry, "/odom_true", 10)
     pub_map = io.create_publisher(OccupancyGrid, "/global_costmap/costmap", latched)
     grid = OccupancyGrid()
@@ -90,7 +102,6 @@ def stack():
 
     def feed():
         while rclpy.ok():
-            pub_obj.publish(String(data=json.dumps(OBJECTS)))
             o = Odometry()
             o.header.frame_id = "map"
             o.pose.pose.orientation.w = 1.0
@@ -100,11 +111,10 @@ def stack():
     client = ActionClient(io, NavigateNL, "/m20/nlnav/navigate")
     assert client.wait_for_server(timeout_sec=10.0)
     deadline = time.time() + 10.0                    # wait until the node has seen the world
-    while time.time() < deadline and (nl.objects_json is None or nl.pose is None or nl.grid is None):
+    while time.time() < deadline and (nl.pose is None or nl.grid is None):
         time.sleep(0.1)
     yield {"client": client, "fake": fake, "nl": nl}
     rclpy.shutdown()
-    os.unlink(scene.name)
 
 
 def call(client, text, dry_run=False, pick=-1, cancel_after=None):
@@ -126,49 +136,57 @@ def call(client, text, dry_run=False, pick=-1, cancel_after=None):
     return r.result().result
 
 
+def test_object_map_loaded_from_file(stack):
+    assert len(stack["nl"].omap.objects) == 4
+
+
 def test_dry_run_plan_does_not_drive(stack):
     n0 = len(stack["fake"].received)
-    r = call(stack["client"], "go to the printer", dry_run=True)
-    assert r.status == "plan" and r.success and len(r.items) == 1
+    r = call(stack["client"], Q("printer"), dry_run=True)
+    assert r.status == "plan" and r.success and len(r.items) == 1 and r.tier == 1
     assert r.items[0].label == "printer #1"
     assert len(stack["fake"].received) == n0
 
 
-def test_drives_highest_confidence_via_runmission(stack):
-    r = call(stack["client"], "go to the chair")
+def test_drives_best_match_via_runmission(stack):
+    r = call(stack["client"], Q("printer"))
     assert r.status == "done" and r.success
-    assert stack["fake"].received[-1][0][0] == "office chair #3"
+    assert stack["fake"].received[-1][0][0] == "printer #1"
 
 
-def test_several_matches_are_listed_and_pick_overrides(stack):
-    r = call(stack["client"], "go to the chair", dry_run=True)
-    assert r.status == "plan" and r.items[0].label == "office chair #3"      # highest confidence
-    assert {c.object_id for c in r.candidates} == {2, 3}
-    r = call(stack["client"], "go to the chair", dry_run=True, pick=2)
+def test_relation_and_pick(stack):
+    r = call(stack["client"], json.dumps({"steps": [{"target": "chair", "anchor": "whiteboard",
+                                                     "relation": "near", "pick": "best"}], "stop": False}),
+             dry_run=True)
     assert r.status == "plan" and r.items[0].label == "office chair #2"
+    r = call(stack["client"], Q("chair"), dry_run=True, pick=3)
+    assert r.items[0].label == "office chair #3"
 
 
-def test_waypoint_and_multi_step(stack):
-    r = call(stack["client"], "go to stop 3 then go to the printer then come back")
+def test_named_place_and_multi_step(stack):
+    r = call(stack["client"], Q("dock", "printer", "back"))
     assert r.status == "done"
-    labels = [lab for lab, _, _ in stack["fake"].received[-1]]
-    assert labels == ["stop 3", "printer #1", "back"]
+    assert [lab for lab, _, _ in stack["fake"].received[-1]] == ["dock", "printer #1", "back"]
 
 
-def test_not_understood_and_not_seen(stack):
-    r = call(stack["client"], "go to the red chair")
-    assert r.status == "not_found" and not r.success and "didn't understand" in r.detail
-    r = call(stack["client"], "go to the ladder")
-    assert r.status == "not_found" and "haven't seen" in r.detail
+def test_not_understood_and_not_found(stack):
+    r = call(stack["client"], "go to the printer")              # not a query: the JSON backend refuses
+    assert r.status == "not_understood" and not r.success and "rephrase" in r.detail
+    r = call(stack["client"], Q("forklift"))
+    assert r.status == "not_found" and "closest" in r.detail and len(r.candidates) == 3
 
 
-def test_cancel_is_forwarded_to_the_mission(stack):
+def test_stop_and_cancel_forwarding(stack):
     stack["fake"].secs = 3.0
     c0 = stack["fake"].canceled
-    r = call(stack["client"], "go to the printer", cancel_after=0.8)
+    r = call(stack["client"], Q("printer"), cancel_after=0.8)
     stack["fake"].secs = 0.6
     assert r.status == "canceled"
     t = time.time()
     while stack["fake"].canceled == c0 and time.time() - t < 3.0:
         time.sleep(0.05)
     assert stack["fake"].canceled == c0 + 1
+    r = call(stack["client"], Q(stop=True))
+    assert r.status == "stopped" and r.success
+    r = call(stack["client"], "stop")              # plain text: the JSON backend would refuse it, so this
+    assert r.status == "stopped" and r.success     # proves "stop" bypasses the parser entirely

@@ -10,11 +10,11 @@ bool dry_run                    # true = resolve only (preview/confirm); false =
 int32 pick_id                   # force a specific object id (e.g. m20 say --pick); -1 = none
 ---
 bool success
-string status                   # plan | not_found | error | done | canceled | stopped
+string status                   # plan | not_found | not_understood | error | done | canceled | stopped
 string interpretation           # human-readable, e.g. "printer #14 (0.82)"
 m20_msgs/MissionItem[] items    # the resolved goals (map frame)
 m20_msgs/NLCandidate[] candidates
-uint8 tier                      # 0 = exact match (Phase 1)
+uint8 tier                      # 0 = exact match (Phase 1, retired), 1 = LLM-parsed (offline phase)
 float32 latency_ms              # time to resolve (not to drive)
 string detail
 ---

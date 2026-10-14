@@ -1,21 +1,20 @@
-"""m20_nlnav: natural-language navigation node (docs/NL_NAVIGATION_DESIGN.md).
+"""m20_nlnav: natural-language navigation node, offline phase (docs/NL_NAVIGATION_DESIGN.md; the
+"NL Nav Architecture" plan: offline semantic map for known sites).
 
-Serves m20_msgs/action/NavigateNL on /m20/nlnav/navigate: text -> parse -> resolve against what
-the robot has seen -> goal poses -> ONE RunMission on /m20/mission/run (m20_missions stays the
-sole driver, ADR-014; the Commander can still veto, ADR-005). The language layer only chooses
-goal poses: it never commands velocity.
+Serves m20_msgs/action/NavigateNL on /m20/nlnav/navigate:
+  text --LLM (llm.py, structured output only)--> query --semantic.py (plain code, object map)--> goal poses
+  --ComputePathToPose reachability--> ONE RunMission on /m20/mission/run (m20_missions stays the sole
+  driver, ADR-014; the Commander can still veto, ADR-005). The language layer never commands velocity and
+  never picks the goal itself: the LLM only fills the query schema.
 
-Phase 1 = tier 0 only (exact names + synonyms, tier0.py). Text it can't fully parse is answered
-not_found, never guessed; the LLM/VLM tiers plug in where tier0.parse() returns None.
-
-Inputs:  /detections/objects (std_msgs/String JSON, confirmed object map; detector_node.py)
+Inputs:  the site's object map (param object_map: format v1 JSON, tools/semmap/build_object_map.py;
+           re-read when it changes)
          odom (nav_msgs/Odometry, param odom_topic, default /odom_true in the sim)
-         Nav2's global costmap for approach-pose checks: fetched per command from the
-           /global_costmap/get_costmap service (the topic only publishes on change, and its
-           latched copy doesn't reliably reach late subscribers across containers here);
-           /global_costmap/costmap (OccupancyGrid) is the fallback
-         scene yaml `waypoints:` (param scene_yaml; re-read when it changes)
-Outputs: /m20/nlnav/markers (visualization_msgs/MarkerArray: candidates, target, goals)
+         Nav2's global costmap (get_costmap service per command; the topic as fallback)
+         scene yaml `waypoints:` (param scene_yaml) = named places ("start", ...)
+Params:  llm (ollama | claude | json; env NLNAV_LLM overrides), text_encoder (owl | label),
+         threshold (OWLv2 probability to count as a match), reach_check (bool)
+Outputs: /m20/nlnav/markers (candidates, target, goals), /m20/health
 """
 import math
 import os
@@ -32,20 +31,16 @@ from rclpy.qos import (QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryP
                        qos_profile_sensor_data)
 
 from geometry_msgs.msg import Point
+from nav2_msgs.action import ComputePathToPose
 from nav2_msgs.srv import GetCostmap
 from nav_msgs.msg import OccupancyGrid, Odometry
-from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 from m20_msgs.action import NavigateNL, RunMission
 from m20_msgs.msg import HealthReport, MissionItem, NLCandidate
 
-from . import tier0
-from .resolve import resolve
-from .world import (DETECTOR_CLASSES, World, grid_from_costmap, grid_from_msg, objects_from_json,
-                    waypoints_from_scene)
-
-HELP = ("I can follow simple commands so far: 'go to the printer', 'go to the nearest chair', "
-        "'go to stop 3', 'go back to the start', 'stop', and chains with 'then'")
+from . import llm, semantic
+from .object_map import ObjectMap
+from .world import grid_from_costmap, grid_from_msg, waypoints_from_scene
 
 
 def yaw_of(q) -> float:
@@ -55,25 +50,26 @@ def yaw_of(q) -> float:
 class NLNavNode(Node):
     def __init__(self):
         super().__init__("m20_nlnav")
-        self.declare_parameter("scene_yaml", "")
-        self.declare_parameter("min_score", 0.5)               # = Viser's default Min confidence
-        self.declare_parameter("odom_topic", "/odom_true")
-        self.declare_parameter("objects_topic", "/detections/objects")
-        self.declare_parameter("costmap_topic", "/global_costmap/costmap")
-        self.declare_parameter("costmap_service", "/global_costmap/get_costmap")
+        for name, default in (("scene_yaml", ""), ("object_map", ""), ("odom_topic", "/odom_true"),
+                              ("costmap_topic", "/global_costmap/costmap"),
+                              ("costmap_service", "/global_costmap/get_costmap"),
+                              ("llm", os.environ.get("NLNAV_LLM", "ollama")), ("text_encoder", "owl"),
+                              ("threshold", 0.10), ("reach_check", True)):
+            self.declare_parameter(name, default)
         p = lambda n: self.get_parameter(n).value
-        self.min_score = float(p("min_score"))
-        self.scene_yaml = p("scene_yaml")
+        self.scene_yaml, self.map_path = p("scene_yaml"), p("object_map")
+        self.threshold, self.reach_check = float(p("threshold")), bool(p("reach_check"))
+        self.backend = llm.make_backend(p("llm"))
+        self.encoder_kind, self._encoder, self.enc_lock = p("text_encoder"), None, threading.Lock()
 
         self.cb = ReentrantCallbackGroup()
         self.lock = threading.Lock()
-        self.objects_json = None
         self.pose = None
         self.grid, self.grid_t = None, 0.0
         self.waypoints, self.scene_mtime = {}, None
+        self.omap, self.map_mtime = ObjectMap(), None
         self.active = None                     # (RunMission goal handle) of OUR running mission
 
-        self.create_subscription(String, p("objects_topic"), self.on_objects, 10, callback_group=self.cb)
         self.create_subscription(Odometry, p("odom_topic"), self.on_odom, qos_profile_sensor_data,
                                  callback_group=self.cb)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -81,6 +77,7 @@ class NLNavNode(Node):
         self.create_subscription(OccupancyGrid, p("costmap_topic"), self.on_costmap, latched,
                                  callback_group=self.cb)
         self.get_costmap = self.create_client(GetCostmap, p("costmap_service"), callback_group=self.cb)
+        self.planner = ActionClient(self, ComputePathToPose, "/compute_path_to_pose", callback_group=self.cb)
         self.markers = self.create_publisher(MarkerArray, "/m20/nlnav/markers", 10)
         self.mission = ActionClient(self, RunMission, "/m20/mission/run", callback_group=self.cb)
         self.server = ActionServer(self, NavigateNL, "/m20/nlnav/navigate",
@@ -92,14 +89,29 @@ class NLNavNode(Node):
         self.health_pub = self.create_publisher(HealthReport, "/m20/health", 10)
         self.create_timer(1.0, self.heartbeat, callback_group=self.cb)
         self.load_waypoints()
-        self.get_logger().info(f"NL navigation up: /m20/nlnav/navigate (NavigateNL); "
-                               f"{len(self.waypoints)} waypoints from {self.scene_yaml or '(none)'}")
+        self.load_object_map()
+        self.get_logger().info(
+            f"NL navigation (offline phase) up: llm={self.backend.name}, encoder={self.encoder_kind}, "
+            f"{len(self.omap.objects)} objects from {self.map_path or '(no object map)'}, "
+            f"{len(self.waypoints)} named places")
+        threading.Thread(target=self.warm_up, daemon=True).start()
+
+    def warm_up(self):
+        """Load the LLM and the text encoder now, so the first instruction doesn't pay a 15-20 s cold start."""
+        t = time.time()
+        try:
+            self.encoder()("chair")
+            if hasattr(self.backend, "warm"):
+                self.backend.warm()                      # weights into memory...
+                # ...and one real parse: the first generation also pays the system prompt's KV cache
+                # and the JSON-schema grammar (~20 s cold, measured), which `warm` alone doesn't touch.
+                llm.parse("stop", self.backend, sorted({w.name for w in self.waypoints.values()} | {"start"}),
+                          timeout_s=60.0)
+            self.get_logger().info(f"warm-up done in {time.time() - t:.1f} s")
+        except Exception as e:                 # not fatal: the first query just pays the load instead
+            self.get_logger().warn(f"warm-up failed ({type(e).__name__}: {e})")
 
     # ---------- inputs ----------
-    def on_objects(self, m):
-        with self.lock:
-            self.objects_json = m.data
-
     def on_odom(self, m):
         q = m.pose.pose.orientation
         with self.lock:
@@ -115,66 +127,109 @@ class NLNavNode(Node):
         if not self.scene_yaml or not os.path.exists(self.scene_yaml):
             return
         mt = os.path.getmtime(self.scene_yaml)
-        if mt == self.scene_mtime:
+        if mt != self.scene_mtime:
+            with open(self.scene_yaml) as f:
+                self.waypoints = waypoints_from_scene(yaml.safe_load(f) or {})
+            self.scene_mtime = mt
+
+    def load_object_map(self):
+        if not self.map_path or not os.path.exists(self.map_path):
             return
-        with open(self.scene_yaml) as f:
-            self.waypoints = waypoints_from_scene(yaml.safe_load(f) or {})
-        self.scene_mtime = mt
+        mt = os.path.getmtime(self.map_path)
+        if mt != self.map_mtime:
+            self.omap = ObjectMap.load(self.map_path)
+            self.map_mtime = mt
+            self.get_logger().info(f"object map: {len(self.omap.objects)} objects ({self.map_path})")
+
+    def encoder(self):
+        with self.enc_lock:                    # warm-up thread and a first query may race to load it
+            if self._encoder is None:
+                self._encoder = semantic.OwlTextEncoder() if self.encoder_kind == "owl" else semantic.LabelEncoder()
+        return self._encoder
 
     def fetch_grid(self, timeout_s: float = 2.0):
-        """Current global costmap from Nav2's service, or None."""
-        if not self.get_costmap.wait_for_service(timeout_sec=0.5):
-            return None
-        fut = self.get_costmap.call_async(GetCostmap.Request())
-        t = time.time()
-        while not fut.done() and time.time() - t < timeout_s:
-            time.sleep(0.01)
-        if not fut.done() or fut.result() is None:
-            return None
-        m = fut.result().map
-        md = m.metadata
-        return grid_from_costmap(md.size_x, md.size_y, md.resolution,
-                                 (md.origin.position.x, md.origin.position.y), m.data)
-
-    def snapshot(self) -> World:
-        self.load_waypoints()
-        grid = self.fetch_grid()
+        """Current global costmap from Nav2's service, or the last topic message, or None."""
+        if self.get_costmap.wait_for_service(timeout_sec=0.5):
+            fut = self.get_costmap.call_async(GetCostmap.Request())
+            t = time.time()
+            while not fut.done() and time.time() - t < timeout_s:
+                time.sleep(0.01)
+            if fut.done() and fut.result() is not None:
+                m = fut.result().map
+                md = m.metadata
+                return grid_from_costmap(md.size_x, md.size_y, md.resolution,
+                                         (md.origin.position.x, md.origin.position.y), m.data)
         with self.lock:
-            every = objects_from_json(self.objects_json) if self.objects_json else []
-            if grid is None and self.grid is not None:
-                self.get_logger().warn("get_costmap unavailable: using the last costmap topic message")
-                grid = self.grid
-            return World(objects=[o for o in every if o.score >= self.min_score],
-                         low_conf=[o for o in every if o.score < self.min_score],
-                         min_score=self.min_score, waypoints=dict(self.waypoints), pose=self.pose,
-                         grid=grid)
+            return self.grid
+
+    def reachable(self, goal, timeout_s: float = 3.0) -> bool:
+        """Nav2's planner finds a path to (x, y, yaw)? Unknown (no planner) counts as yes."""
+        if not self.planner.wait_for_server(timeout_sec=0.5):
+            return True
+        g = ComputePathToPose.Goal()
+        g.goal.header.frame_id = "map"
+        g.goal.pose.position.x, g.goal.pose.position.y = float(goal[0]), float(goal[1])
+        g.goal.pose.orientation.z, g.goal.pose.orientation.w = math.sin(goal[2] / 2), math.cos(goal[2] / 2)
+        g.use_start = False
+        send = self.planner.send_goal_async(g)
+        t = time.time()
+        while not send.done() and time.time() - t < timeout_s:
+            time.sleep(0.01)
+        if not send.done() or not send.result().accepted:
+            return True
+        res = send.result().get_result_async()
+        while not res.done() and time.time() - t < timeout_s:
+            time.sleep(0.01)
+        return bool(res.done() and len(res.result().result.path.poses) > 0)
 
     # ---------- action ----------
     def execute(self, gh):
         req = gh.request
         t0 = time.time()
         res = NavigateNL.Result()
-        res.tier = 0
+        res.tier = 1                                           # 1 = LLM-parsed (tier 0 retired)
         self._fb(gh, "resolving")
-        world = self.snapshot()
-        known = sorted(set(DETECTOR_CLASSES) | set(world.classes()))
-        cmd = tier0.parse(req.text, known, world.waypoints)
-        if cmd is None:
-            return self._finish(gh, res, t0, "not_found", detail=f"didn't understand '{req.text}'. {HELP}")
-        r = resolve(cmd, world, pick_id=req.pick_id)        # single mode: req.mode is ignored
+        try:
+            self.load_waypoints()
+            self.load_object_map()
+        except Exception as e:                 # half-written / wrong-version file: answer, don't kill the goal
+            return self._finish(gh, res, t0, "error", detail=f"can't load the site files ({type(e).__name__}: {e})")
+        places = sorted({w.name for w in self.waypoints.values()} | {"start"})
+        try:
+            q = llm.Query([], True) if llm.is_stop(req.text) else llm.parse(req.text, self.backend, places)
+        except llm.ParserUnavailable as e:
+            return self._finish(gh, res, t0, "error", detail=str(e))
+        except llm.NotUnderstood as e:
+            return self._finish(gh, res, t0, "not_understood", detail=f"{e}. Please rephrase.")
+        if q.stop:
+            stopped = self.cancel_active()
+            return self._finish(gh, res, t0, "stopped", success=True,
+                                detail="stopped" if stopped else "nothing of mine was running")
+        with self.lock:
+            pose = self.pose
+        t1 = time.time()
+        grid = self.fetch_grid()
+        t2 = time.time()
+        try:                                   # e.g. text_encoder:=owl in an image without torch
+            r = semantic.resolve(q, self.omap, self.encoder(), self.waypoints, pose=pose, grid=grid,
+                                 threshold=self.threshold, pick_id=req.pick_id,
+                                 reach_fn=self.reachable if self.reach_check else None)
+        except Exception as e:
+            self.get_logger().error(f"resolve failed: {type(e).__name__}: {e}")
+            return self._finish(gh, res, t0, "error", detail=f"resolver failed ({type(e).__name__}: {e})")
+        self.get_logger().info(f"timing: llm {1e3 * (t1 - t0):.0f} ms, costmap {1e3 * (t2 - t1):.0f} ms, "
+                               f"resolve+reach {1e3 * (time.time() - t2):.0f} ms")
         res.interpretation = r.interpretation
         res.candidates = [self._cand(c) for c in r.candidates]
         res.items = [self._item(s) for s in r.steps]
         self.publish_markers(r)
-        if r.status == "stop":
-            stopped = self.cancel_active()
-            return self._finish(gh, res, t0, "stopped", success=True,
-                                detail="stopped" if stopped else "nothing of mine was running")
         if r.status != "plan":
             return self._finish(gh, res, t0, r.status, detail=r.detail)
         if req.dry_run:
-            return self._finish(gh, res, t0, "plan", success=True, detail="dry run: not driving")
+            return self._finish(gh, res, t0, "plan", success=True,
+                                detail=("dry run: not driving" + (f"; {r.detail}" if r.detail else "")))
         res.latency_ms = 1e3 * (time.time() - t0)
+        res.detail = r.detail
         return self._drive(gh, res)
 
     def _drive(self, gh, res):
@@ -212,8 +267,9 @@ class NLNavNode(Node):
         wrapped = result_f.result()
         mres = wrapped.result
         ok = bool(mres.success)
-        status = "done" if ok else ("canceled" if wrapped.status == 5 else "error")   # 5 = CANCELED
-        return self._finish(gh, res, None, status, success=ok, detail=mres.detail)    # ('stop' / a newer command)
+        status = "done" if ok else ("canceled" if wrapped.status == 5 else "error")   # 5 = CANCELED ('stop' / newer)
+        detail = mres.detail + (f"; {res.detail}" if res.detail and ok else "")
+        return self._finish(gh, res, None, status, success=ok, detail=detail)
 
     def cancel_active(self) -> bool:
         mgh, self.active = self.active, None
@@ -249,7 +305,7 @@ class NLNavNode(Node):
     @staticmethod
     def _cand(c) -> NLCandidate:
         m = NLCandidate()
-        m.object_id, m.cls, m.score, m.why = int(c.obj.id), c.obj.cls, float(c.obj.score), c.why
+        m.object_id, m.cls, m.score, m.why = int(c.obj.id), c.obj.label, float(c.score), c.why
         m.position = Point(x=float(c.obj.xyz[0]), y=float(c.obj.xyz[1]), z=float(c.obj.xyz[2]))
         return m
 
@@ -259,7 +315,7 @@ class NLNavNode(Node):
         h.header.stamp = self.get_clock().now().to_msg()
         h.node_name = self.get_name()
         with self.lock:
-            blind = [n for n, v in (("object map", self.objects_json), ("pose", self.pose)) if v is None]
+            blind = [n for n, v in (("object map", self.omap.objects or None), ("pose", self.pose)) if v is None]
         h.status = HealthReport.STATUS_WARN if blind else HealthReport.STATUS_OK
         h.message = ("no " + ", no ".join(blind)) if blind else "serving /m20/nlnav/navigate"
         self.health_pub.publish(h)
