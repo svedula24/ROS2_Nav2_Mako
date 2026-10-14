@@ -23,6 +23,10 @@ from .object_map import MapObject, ObjectMap, normalize, owl_prob
 from .world import DETECTOR_CLASSES, classes_for, norm_name
 
 NEAR_M, REL_MAX_M, LATERAL_M = 1.5, 3.0, 1.5
+# "best": if the top match can't be reached, only fall back to a candidate scoring at least this fraction of it.
+# Without a floor the robot silently went to a 0.55 ladder when stale costmap marks hid the 0.88 and 0.86 ones
+# (2026-10-14). Uncalibrated: chosen so near-ties (0.86 vs 0.88) still fall back and clear downgrades don't.
+FALLBACK_MIN_RATIO = 0.8
 
 
 @dataclass
@@ -179,19 +183,29 @@ def resolve(q: Query, omap: ObjectMap, encoder: Callable[[str], np.ndarray], way
                 note = (f"close call: {cands[1].obj.label} #{cands[1].obj.id} scored {cands[1].score:.2f}"
                         if close else "")
             shown = cands[:5]
-            goal, why_not, chosen = None, "", None
+            # "nearest" already kept only good matches (>= half the best), so any of them may stand in; for "best",
+            # a stand-in must be nearly as good as the top match, else say we can't reach it rather than downgrade
+            floor = 0.0 if s.pick == "nearest" else FALLBACK_MIN_RATIO * cands[0].score
+            goal, why_not, chosen, skipped = None, "", None, []
             for c in cands[:5]:
+                if c is not cands[0] and c.score < floor:
+                    skipped.append(c)
+                    continue
                 goal, why_not = approach_pose(c.obj.xy, c.obj.radius, grid, from_xy=here)
                 if goal is not None and (reach_fn is None or reach_fn(goal)):
                     chosen = c
                     break
                 goal = None
             if goal is None:
+                weaker = (f"; weaker matches not used: " + ", ".join(f"{c.obj.label} #{c.obj.id} ({c.score:.2f})"
+                                                                     for c in skipped[:3])) if skipped else ""
                 return Resolution("not_found", candidates=shown,
                                   detail=f"found {cands[0].obj.label} #{cands[0].obj.id} but can't reach it "
-                                         f"({why_not or 'no path'})")
+                                         f"({why_not or 'no path'}){weaker}")
             if chosen is not cands[0]:
-                note = (note + "; " if note else "") + f"{cands[0].obj.label} #{cands[0].obj.id} unreachable"
+                # replaces, not appends: the close-call note was about the runner-up, which may be the one chosen
+                # now ("close call: #223 scored 0.49" printed for #223 itself, live test 2026-10-14)
+                note = f"{cands[0].obj.label} #{cands[0].obj.id} ({cands[0].score:.2f}) unreachable"
             steps.append(GoalStep(f"{chosen.obj.label} #{chosen.obj.id}", goal, chosen.obj, note))
         here = steps[-1].goal[:2]
     parts = [f"{st.label} ({next((c.score for c in shown if c.obj is st.obj), 0):.2f})" if st.obj else st.label

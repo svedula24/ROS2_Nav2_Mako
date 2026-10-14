@@ -95,6 +95,7 @@ def test_close_scores_go_to_best_and_say_so():
 def test_unreachable_falls_back_to_next_candidate():
     r = run(q("trash can"), reach_fn=lambda goal: goal[1] < 1.5)      # only goals south of y=1.5 reachable
     assert r.status == "plan" and r.steps[0].obj.id == 3 and "unreachable" in r.detail
+    assert "close call" not in r.detail          # the tie note named #3, the object now chosen: misleading after a fallback
 
 
 def test_relation_geometry_left_right_front_behind():
@@ -121,3 +122,16 @@ def test_nearest_means_nearest_good_match_not_nearest_weak_one():
     r = resolve(q(("trash can", None, None, "nearest")), omap, ENC, WPS, pose=(0.0, 0.0, 0.0), grid=open_grid())
     assert r.status == "plan" and r.steps[0].obj.label == "trash can" and r.steps[0].obj.id == 3
     assert "nearest of 2" in r.detail
+
+
+def test_unreachable_best_does_not_downgrade_to_a_weak_match():
+    """Top match unreachable + only a much weaker alternative -> not_found naming both, never the weak one.
+    (2026-10-14: stale costmap marks hid ladders 0.88/0.86 and the robot chose a 0.55 ladder.)"""
+    e_tc, e_desk = label_embedding("trash can"), label_embedding("desk")
+    weak = 0.3 * e_tc + math.sqrt(1 - 0.3 ** 2) * e_desk
+    other = MapObject(9, "refrigerator", (-3.0, -3.0, 0.5), (0.5, 0.5, 1.0), weak / np.linalg.norm(weak),
+                      -0.5, 10.0, 0.8, 4, 0.0, 0.8)
+    omap = ObjectMap([mo(2, "trash can", (2.0, 3.0)), other])
+    r = resolve(q("trash can"), omap, ENC, WPS, pose=(0.0, 0.0, 0.0), grid=open_grid(),
+                reach_fn=lambda goal: goal[1] < 1.5)          # #2 (north) unreachable, #9 (south) reachable
+    assert r.status == "not_found" and "can't reach" in r.detail and "#9" in r.detail
