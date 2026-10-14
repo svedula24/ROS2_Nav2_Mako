@@ -82,6 +82,11 @@ else
   api_up || { echo "ERROR: the sim's API never came up (check the Godot window for errors)"; exit 1; }
   sleep 5                                       # let the splat settle before streaming
 fi
+# Park the window almost entirely off-screen so the desk stays usable (rendering continues; only a MINIMIZED
+# window stops the camera/lidar). GODOT_SHOW=1 keeps it visible; `godot_window.ps1 show` brings it back any time.
+if [ "${GODOT_SHOW:-0}" != "1" ]; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$REPO/tools/godot/godot_window.ps1")" park 2>&1 | tr -d '\r' || true   # not fatal, but errors stay visible
+fi
 
 # 2. the bridge: sim <-> ROS topics (replaces the MuJoCo container + locomotion bridge)
 echo "[godot_sim_up] starting the Godot ROS bridge"
@@ -119,19 +124,10 @@ fi
 
 # 4b. NL navigation: LLM query -> object map lookup -> approach pose -> RunMission
 [ -f "$OBJECT_MAP" ] || echo "[godot_sim_up] NOTE: no object map at $OBJECT_MAP: only named places will resolve (tools/semmap/record_mapping_run.sh, then build_object_map.sh)"
-echo "[godot_sim_up] starting NL navigation (llm=$LLM)"
-mkdir -p "$(dirname "$OBJECT_MAP")"
-NL_ENV=(-e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUNBUFFERED=1
-        -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e NLNAV_LLM="$LLM" -e NLNAV_LLM_MODEL="$LLM_MODEL")
-[ -n "${ANTHROPIC_API_KEY:-}" ] && NL_ENV+=(-e ANTHROPIC_API_KEY)
-NL_CMD="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export PYTHONPATH=/nlnav:\$PYTHONPATH;"
-NL_CMD+=" python3 -c 'from m20_nlnav.nlnav_node import main; main()' --ros-args"
-NL_CMD+=" -p scene_yaml:=/scene/${SCENE%.xml}.scene.yaml -p object_map:=/semmap/$(basename "$OBJECT_MAP")"
-NL_CMD+=" -p llm:=$LLM -p text_encoder:=owl"
-docker rm -f m20_nlnav >/dev/null 2>&1 || true
-docker run -d --name m20_nlnav --network host --ipc host "${NL_ENV[@]}" \
-  -v "$REPO/src/m20_nlnav":/nlnav:ro -v "$REPO/tools/sim":/scene:ro -v "$(dirname "$OBJECT_MAP")":/semmap:ro \
-  m20_splat:latest bash -lc "$NL_CMD" >/dev/null
+echo "[godot_sim_up] starting NL navigation (llm=$LLM, model=$LLM_MODEL)"
+# tools/godot/nlnav_up.sh owns the container start (tools/nlnav_eval/eval.sh restarts it with another model)
+bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "$SCENE" --llm "$LLM" --model "$LLM_MODEL" \
+  --min-label-score "${MIN_LABEL_SCORE:-0.4}" >/dev/null
 
 # 4b'. Nav2 robot-pose watchdog: relaunches nav2 if a costmap's published footprint stops updating (the
 # silent frozen-pose failure of 2026-10-13; see the script's header). Log + backtraces in ~/m20_sim/watchdog
@@ -179,7 +175,7 @@ echo " GODOT SIM:  the Godot window (M20 on $SITE)"
 echo " COMMANDS:   tools/dev/m20 say \"go to the ladder\"   |   tools/dev/m20 say stop"
 echo " MAPPING:    bash tools/semmap/record_mapping_run.sh   then   bash tools/semmap/build_object_map.sh <run>"
 echo " >>> LEAVE THIS TERMINAL OPEN <<<   (Ctrl-C here = shut the ROS stack down)"
-echo " >>> KEEP THE GODOT WINDOW UN-MINIMIZED <<<  (minimized = no rendering = no camera/lidar frames)"
+echo " GODOT WINDOW: parked off-screen (never minimize it: minimized = no camera/lidar). Show it: powershell tools/godot/godot_window.ps1 show"
 echo "=================================================================="
 # The bridge is the stack's heartbeat: gone for good = tear everything down. A `docker restart
 # m20_godot_bridge` (picking up a code change) stops it for a second or two; give it 15 s to come
