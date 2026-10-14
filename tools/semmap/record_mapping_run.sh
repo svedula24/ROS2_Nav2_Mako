@@ -2,23 +2,34 @@
 # Offline phase, step 1: drive a coverage tour of the site and record keyframes for the object map.
 # Run with the stack up (tools/godot/godot_sim_up.sh in another terminal; robot armed ASSISTED).
 #
-#   bash tools/semmap/record_mapping_run.sh [--site circuit4] [--spacing 3.0]
+#   bash tools/semmap/record_mapping_run.sh [--site circuit4] [--spacing 3.0] [--resume]
 #   -> ~/m20_sim/semmap/<site>/run_<timestamp>/ (keyframes), then build the map with
-#      bash tools/semmap/build_object_map.sh ~/m20_sim/semmap/<site>/run_<timestamp>
+#      bash tools/semmap/build_object_map.sh ~/m20_sim/semmap/<site>/run_<timestamp> [more runs...]
+# --resume: drive only the tour stops that no earlier run of this site passed within 2 m of (nearest first
+#   from the robot), e.g. after a run that ended early; then build from all the runs together.
 set -e
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-SITE=circuit4; SPACING=3.0
+SITE=circuit4; SPACING=3.0; RESUME=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --site) SITE="$2"; shift ;;
     --spacing) SPACING="$2"; shift ;;
+    --resume) RESUME=1 ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
   shift
 done
 MAP_YAML="$REPO/tools/sim/godot_${SITE}_map.yaml"
 [ -f "$MAP_YAML" ] || { echo "ERROR: $MAP_YAML missing (tools/godot/site_map.py)"; exit 1; }
-RUN="$HOME/m20_sim/semmap/$SITE/run_$(date +%Y%m%d_%H%M%S)"
+SITE_DIR="$HOME/m20_sim/semmap/$SITE"
+SKIP=()
+if [ "$RESUME" = "1" ]; then
+  for d in "$SITE_DIR"/run_*/; do                        # earlier runs with real data (not aborted stubs)
+    [ "$(wc -l < "$d/index.jsonl" 2>/dev/null || echo 0)" -gt 20 ] && SKIP+=("/site/$(basename "$d")")
+  done
+  [ ${#SKIP[@]} -gt 0 ] || { echo "ERROR: --resume but no earlier run with keyframes in $SITE_DIR"; exit 1; }
+fi
+RUN="$SITE_DIR/run_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN"
 
 pose=$(python3 - <<'PY'
@@ -29,9 +40,11 @@ t = json.loads(b)["base_enu"]["t"]; print(f"{t[0]:.2f} {t[1]:.2f}")
 PY
 )
 echo "[mapping] robot at $pose; planning a coverage tour (spacing $SPACING m)"
-mapfile -t STOPS < <(docker run --rm -v "$REPO":/repo:ro m20_splat:latest \
-  python3 /repo/tools/semmap/coverage_tour.py /repo/tools/sim/$(basename "$MAP_YAML") --start $pose --spacing "$SPACING")
+mapfile -t STOPS < <(docker run --rm -v "$REPO":/repo:ro -v "$SITE_DIR":/site:ro m20_splat:latest \
+  python3 /repo/tools/semmap/coverage_tour.py /repo/tools/sim/$(basename "$MAP_YAML") --start $pose --spacing "$SPACING" \
+  ${SKIP[@]:+--skip-seen "${SKIP[@]}"})
 echo "[mapping] ${#STOPS[@]} stops"
+[ ${#STOPS[@]} -gt 0 ] || { echo "[mapping] nothing left to cover"; rmdir "$RUN"; exit 0; }
 
 docker rm -f m20_semmap_rec >/dev/null 2>&1 || true
 docker run -d --name m20_semmap_rec --network host --ipc host \

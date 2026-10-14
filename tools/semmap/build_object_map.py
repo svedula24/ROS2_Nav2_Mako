@@ -88,11 +88,18 @@ def place(depth, box, K, T_map_cam, band=0.35, max_range=6.0):
     return ((lo + hi) / 2).tolist(), size.tolist()
 
 
-def build(run_dir, out_path, min_sightings=2, max_area=0.35, every=1, log=print):
+def build(run_dirs, out_path, min_sightings=2, max_area=0.35, every=1, log=print):
+    """run_dirs: one mapping run or several of the same site (e.g. a run that ended early + its --resume);
+    their keyframes are pooled, so an object seen in both runs merges into one."""
     import cv2
     import torch                                           # heavy deps only here: place() stays numpy-only
-    K = json.load(open(os.path.join(run_dir, "camera.json")))
-    frames = [json.loads(l) for l in open(os.path.join(run_dir, "index.jsonl"))][::every]
+    if isinstance(run_dirs, str):
+        run_dirs = [run_dirs]
+    frames, Ks = [], {}
+    for rd in run_dirs:
+        Ks[rd] = json.load(open(os.path.join(rd, "camera.json")))
+        frames += [dict(json.loads(l), run=rd) for l in open(os.path.join(rd, "index.jsonl"))][::every]
+    log(f"[build] {len(frames)} keyframes from {len(run_dirs)} run(s)")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
     proc = Owlv2Processor.from_pretrained(OWL_MODEL)
@@ -102,8 +109,9 @@ def build(run_dir, out_path, min_sightings=2, max_area=0.35, every=1, log=print)
     os.makedirs(os.path.join(out_dir, "crops"), exist_ok=True)
     objs, best_crop, t0 = [], {}, time.time()
     for k, fr in enumerate(frames):
-        bgr = cv2.imread(os.path.join(run_dir, fr["id"] + ".jpg"))
-        depth = np.load(os.path.join(run_dir, fr["id"] + "_depth.npy")).astype(np.float32)
+        bgr = cv2.imread(os.path.join(fr["run"], fr["id"] + ".jpg"))
+        depth = np.load(os.path.join(fr["run"], fr["id"] + "_depth.npy")).astype(np.float32)
+        K = Ks[fr["run"]]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         H, W = rgb.shape[:2]
         for det in owl_frame(model, proc, text, rgb, dev):
@@ -138,7 +146,7 @@ def build(run_dir, out_path, min_sightings=2, max_area=0.35, every=1, log=print)
         if crop is not None and crop.size:
             o.crop = f"crops/obj_{i:04d}.jpg"
             cv2.imwrite(os.path.join(out_dir, o.crop), crop)
-    om = ObjectMap(kept, site=os.path.basename(os.path.dirname(os.path.abspath(run_dir))),
+    om = ObjectMap(kept, site=os.path.basename(os.path.dirname(os.path.abspath(run_dirs[0]))),
                    built=datetime.datetime.now().isoformat(timespec="seconds"))
     om.save(out_path)
     labels = {}
@@ -151,13 +159,13 @@ def build(run_dir, out_path, min_sightings=2, max_area=0.35, every=1, log=print)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir")
-    ap.add_argument("--out", help="default: <run_dir>/../object_map.json")
+    ap.add_argument("run_dirs", nargs="+", help="one or more mapping runs of the same site")
+    ap.add_argument("--out", help="default: <first run_dir>/../object_map.json")
     ap.add_argument("--min-sightings", type=int, default=2)
     ap.add_argument("--every", type=int, default=1, help="use every Nth keyframe (quick tests)")
     a = ap.parse_args()
-    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.run_dir)), "object_map.json")
-    build(a.run_dir, out, a.min_sightings, every=a.every)
+    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.run_dirs[0])), "object_map.json")
+    build(a.run_dirs, out, a.min_sightings, every=a.every)
 
 
 if __name__ == "__main__":
