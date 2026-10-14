@@ -206,11 +206,18 @@ yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
 print("  patched: global costmap = static site map + lidar + inflation (full site, non-rolling)")
 PYEOF
   fi
-  echo "[1.7/7] external sim: depth-camera obstacle layer in both costmaps"
+  echo "[1.7/7] external sim: depth-camera obstacle layer in both costmaps; footprint collision critic"
   docker exec -i $C python3 - <<'PYEOF'
 import yaml
 p = "/cfg/nav2_params.yaml"
 cfg = yaml.safe_load(open(p))
+# DWB's BaseObstacle critic scores only the robot's CENTRE cell, so a trajectory whose centre stays below
+# inscribed cost can still put a wheel into a wall: the skid-steer M20 cut a corridor corner by 6 cm,
+# rode up the wall and tipped over (mapping run, 2026-10-13). ObstacleFootprint checks the whole
+# footprint along each trajectory; same weight as BaseObstacle had.
+f = cfg["controller_server"]["ros__parameters"]["FollowPath"]
+f["critics"] = ["ObstacleFootprint" if c == "BaseObstacle" else c for c in f["critics"]]
+f["ObstacleFootprint.scale"] = f.pop("BaseObstacle.scale", 0.15)
 for k in ("global_costmap", "local_costmap"):
     cm = cfg[k][k]["ros__parameters"]
     if "camera_layer" not in cm["plugins"]:
