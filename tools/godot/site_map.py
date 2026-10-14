@@ -13,7 +13,7 @@ Fusion, at --res (0.05 m):
   1. obstacle = mesh surface inside the robot's band (floor + 0.15 .. floor + 1.0 m).
   2. known floor = mesh floor surface (floor +- 0.10) OR an occupancy floor voxel; known & not obstacle = free,
      anything else = unknown.
-  3. gap fill: an occupancy voxel at robot height (0-1 m) whose 1 m column has NO mesh obstacle, where the
+  3. gap fill (opt-in, --gap-fill): an occupancy voxel at robot height (0-1 m) whose 1 m column has NO mesh obstacle, where the
      mesh saw (almost) no floor (a capture hole, not an open aisle), and whose neighbouring columns have mesh
      obstacles (it continues a wall): its cells the mesh didn't see become obstacle. Isolated voxels are
      floaters and are dropped.
@@ -170,7 +170,7 @@ def remove_specks(occ, min_cells):
 
 # ------------------------------------------------------------------ fusion
 def build(V, F, occ_cells, voxel_m, bounds_xy, floor_z, res=0.05, band=(0.15, 1.0), floor_tol=0.10,
-          wall_layers=(0,), gap_fill=True, max_floor_seen=0.2, min_speck=3):
+          wall_layers=(0,), gap_fill=False, max_floor_seen=0.2, min_speck=3):
     """-> dict(grid, map (h,w) uint8 north-up, stats, layers for the check image)."""
     (bx0, by0), (bx1, by1) = bounds_xy
     g = Grid(bx0, by0, bx1, by1, res)
@@ -292,14 +292,16 @@ def main():
     ap.add_argument("--out", required=True, help="output base path (writes .pgm/.yaml/_check.png)")
     ap.add_argument("--res", type=float, default=0.05)
     ap.add_argument("--band", type=float, nargs=2, default=(0.15, 1.0), help="obstacle band above the floor [m]")
-    ap.add_argument("--no-gap-fill", action="store_true")
+    ap.add_argument("--gap-fill", action="store_true",
+                    help="close mesh gaps from occupancy wall voxels (OFF by default: on circuit4 it walled off "
+                         "drivable aisles where clutter hid the floor from the mesh)")
     ap.add_argument("--min-speck", type=int, default=3)
     a = ap.parse_args()
     bounds, ground = site_bounds(a.site)
     V, F = read_ply(a.mesh)
     occ = os.path.join(a.site, "occupancy.bin")
     voxel, cells = read_occupancy(occ) if os.path.exists(occ) else (1.0, np.zeros((0, 3), int))
-    r = build(V, F, cells, voxel, bounds, ground, a.res, tuple(a.band), gap_fill=not a.no_gap_fill,
+    r = build(V, F, cells, voxel, bounds, ground, a.res, tuple(a.band), gap_fill=a.gap_fill,
               min_speck=a.min_speck)
     write_map(r, a.out)
     write_check(r, a.out + "_check.png")
