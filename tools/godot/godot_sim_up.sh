@@ -9,9 +9,10 @@
 #   bash tools/godot/godot_sim_up.sh --no-site-map   live costmaps only (no Nav2 static map)
 #   bash tools/godot/godot_sim_up.sh --object-map <json>   default ~/m20_sim/semmap/circuit4/object_map.json
 #   bash tools/godot/godot_sim_up.sh --stop-sim   also quit the Godot sim on exit
-#   bash tools/godot/godot_sim_up.sh --loc amcl   localize with AMCL on the site map from DRIFTING odometry
-#                                                 (default --loc gt: the sim's ground-truth pose, demo only;
-#                                                  --loc odom: drifting odometry, NO correction: an eval baseline)
+#   bash tools/godot/godot_sim_up.sh --loc gt     localization: default amcl = AMCL on the site map from DRIFTING
+#                                                 odometry, like the real robot; gt = the sim's ground-truth pose;
+#                                                 odom = drifting odometry, NO correction (an eval baseline).
+#                                                 With --no-site-map the default is gt (AMCL needs the map).
 #   then:  tools/dev/m20 say "go to the ladder"
 # The local LLM (Ollama, NLNAV_LLM_MODEL, default qwen2.5:7b-instruct) runs in m20_ollama and is kept
 # running between launches (the model stays loaded); NLNAV_LLM=claude switches to the Anthropic API.
@@ -26,7 +27,7 @@ GODOT_SIM="${GODOT_SIM:-$(dirname "$REPO")/stateful-drone-sim}"
 SITE="${GODOT_SITE:-circuit4_cam_mesh}"
 SCENE="godot_circuit4.xml"                      # tools/sim/godot_circuit4.scene.yaml (waypoints, splat frame)
 PORT="${VIEW_PORT:-8080}"
-VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"; LOC="${M20_LOC:-gt}"
+VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"; LOC="${M20_LOC:-}"
 OBJECT_MAP="$HOME/m20_sim/semmap/circuit4/object_map.json"
 LLM="${NLNAV_LLM:-ollama}"; LLM_MODEL="${NLNAV_LLM_MODEL:-qwen2.5:7b-instruct}"
 while [ $# -gt 0 ]; do
@@ -37,11 +38,13 @@ while [ $# -gt 0 ]; do
     --no-site-map) SITE_MAP="" ;;
     --object-map) OBJECT_MAP="$2"; shift ;;
     --loc) LOC="$2"; shift ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown option $1 (see --help)"; exit 2 ;;
   esac
   shift
 done
+# default: AMCL (since 2026-10-15), unless there is no site map to localize against
+[ -n "$LOC" ] || { if [ -n "$SITE_MAP" ]; then LOC=amcl; else LOC=gt; fi; }
 case "$LOC" in
   gt) ODOM=truth; GT_LOC=1; POSE_SOURCE=odom_true ;;
   odom) ODOM=drift; GT_LOC=1; POSE_SOURCE=tf ;;   # baseline: drifting odometry, map->odom fixed at identity

@@ -12,7 +12,7 @@
 #   max_loc_err_m, max_loc_yaw_deg (drive) localization: the robot's believed pose (TF map->base_link) stays within
 #                this distance / heading of the sim's ground truth for the whole drive. Always recorded, with the raw
 #                odometry drift (odom_err_max_m). 0 by construction under ground-truth localization (--loc gt); the
-#                real test under AMCL (--loc amcl); recorded but not judged under uncorrected odometry (--loc odom).
+#                real test under AMCL (--loc amcl, the default); recorded but not judged under uncorrected odometry (--loc odom).
 # known_issue: text   the expectation is RIGHT but the system currently fails it; the report lists these
 #                separately so a known failure can't hide a new one. Remove the key when fixed.
 # Ground truth for relation cases: the geometry of CONFIDENT objects (label >= 0.5, >= 3 sightings), seen from the

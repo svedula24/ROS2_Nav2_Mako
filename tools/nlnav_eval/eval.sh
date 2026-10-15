@@ -25,17 +25,25 @@ OBJECT_MAP="$HOME/m20_sim/semmap/$SITE/object_map.json"
 OUT_DIR="$HOME/m20_sim/evals"; mkdir -p "$OUT_DIR"
 TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_DIR/${TAG}_${TS}.json"
 
-if [ -n "$MODEL" ]; then
-  echo "[eval] switching the NL node to $MODEL"
-  docker exec m20_ollama ollama list | grep -q "^${MODEL}" || docker exec m20_ollama ollama pull "$MODEL"
-  bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "godot_$SITE" --model "$MODEL" --wait
-fi
-# configuration block: what this run was measured with
 # localization: odometry from the bridge's GODOT_ODOM; corrected by AMCL if it runs (gt = truth odom, no AMCL;
 # odom = drifting odom, no correction; amcl = drifting odom + AMCL)
 ODOM=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' m20_godot_bridge 2>/dev/null | sed -n 's/^GODOT_ODOM=//p')
 ODOM=${ODOM:-truth}
 if docker exec $C pgrep -f nav2_amcl >/dev/null 2>&1; then LOCMODE=amcl; elif [ "$ODOM" = drift ]; then LOCMODE=odom; else LOCMODE=gt; fi
+
+if [ -n "$MODEL" ]; then
+  echo "[eval] switching the NL node to $MODEL"
+  docker exec m20_ollama ollama list | grep -q "^${MODEL}" || docker exec m20_ollama ollama pull "$MODEL"
+  # only the model changes: carry the running node's LLM backend and label threshold over from its command line
+  # (they may have been set at launch, not in this shell), and keep "here" on the stack's pose source
+  OLD_CMD=$(docker inspect -f '{{join .Config.Cmd " "}}' m20_nlnav 2>/dev/null || true)
+  OLD_LLM=$(sed -n 's/.*-p llm:=\([^ ]*\).*/\1/p' <<<"$OLD_CMD")
+  OLD_MIN=$(sed -n 's/.*-p min_label_score:=\([^ ]*\).*/\1/p' <<<"$OLD_CMD")
+  bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "godot_$SITE" --model "$MODEL" \
+    ${OLD_LLM:+--llm "$OLD_LLM"} ${OLD_MIN:+--min-label-score "$OLD_MIN"} \
+    --pose-source "$([ "$LOCMODE" = gt ] && echo odom_true || echo tf)" --wait
+fi
+# configuration block: what this run was measured with
 CFG=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' m20_nlnav | python3 -c "
 import sys, json, os, subprocess
 env = dict(l.split('=', 1) for l in sys.stdin.read().split() if '=' in l)
