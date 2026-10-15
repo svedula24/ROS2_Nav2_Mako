@@ -9,9 +9,10 @@
 #   near_id/near_xy (drive) sanity bound: end within `near_m` of this object's map position / this point; the
 #                real arrival test is <= approach_tol_m (0.6) from the approach pose the planner chose
 #   stop_after_s (drive) send "stop" this many seconds in; expect canceled, roll-out <= max_rollout_m (0.5), then still
-#   max_loc_err_m (drive) localization: the robot's believed pose (TF map->base_link) stays within this of the
-#                sim's ground truth for the whole drive. SCAFFOLD: always recorded; 0 by construction while the
-#                stack runs on ground-truth localization; meant for AMCL vs ground truth.
+#   max_loc_err_m, max_loc_yaw_deg (drive) localization: the robot's believed pose (TF map->base_link) stays within
+#                this distance / heading of the sim's ground truth for the whole drive. Always recorded, with the raw
+#                odometry drift (odom_err_max_m). 0 by construction under ground-truth localization (--loc gt); the
+#                real test under AMCL (--loc amcl); recorded but not judged under uncorrected odometry (--loc odom).
 # known_issue: text   the expectation is RIGHT but the system currently fails it; the report lists these
 #                separately so a known failure can't hide a new one. Remove the key when fixed.
 # Ground truth for relation cases: the geometry of CONFIDENT objects (label >= 0.5, >= 3 sightings), seen from the
@@ -155,16 +156,22 @@ cases:
   - name: drive_ladder
     drive: true
     text: "go to the ladder"
-    expect: {status: done, labels: [ladder], near_id: 28, near_m: 3.2}
+    expect: {status: done, labels: [ladder], near_id: 28, near_m: 3.2, max_loc_err_m: 0.35, max_loc_yaw_deg: 10}
   - name: drive_ladder_then_start
     drive: true
     text: "go to the ladder then come back to the start"
-    expect: {status: done, labels: [ladder, start], near_xy: [-2.13, 0.35], near_m: 0.8}
+    expect: {status: done, labels: [ladder, start], near_xy: [-2.13, 0.35], near_m: 0.8, max_loc_err_m: 0.35,
+             max_loc_yaw_deg: 10}
   - name: drive_nearest_trash_can
     drive: true
     text: "the nearest trash can"
-    expect: {status: done, labels: [trash can], near_m: 3.2}
+    expect: {status: done, labels: [trash can], near_m: 3.2, max_loc_err_m: 0.35, max_loc_yaw_deg: 10}
   - name: drive_stop
     drive: true
     text: "go to the ladder"
     expect: {status: canceled, stop_after_s: 4}
+  - name: drive_ladder_round_trip_twice    # ~40 m: long enough for odometry drift to matter (localization test)
+    drive: true
+    text: "go to the ladder, then come back to the start, then go to the ladder again"
+    expect: {status: done, labels: [ladder, start, ladder], near_id: 28, near_m: 3.2, max_loc_err_m: 0.35,
+             max_loc_yaw_deg: 10}

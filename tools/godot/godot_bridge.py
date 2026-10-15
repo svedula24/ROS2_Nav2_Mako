@@ -5,8 +5,12 @@ Stands in for tools/mujoco_sim.py + the locomotion bridge, so the rest of the st
 Nav2, mission server, m20_nlnav, detector, Viser) runs unchanged against the Godot world.
 
 Published (stamped on this process's wall clock, the same as TF; map = the site's ENU frame):
-  /odom (odom -> base_link) + TF odom->base_link   ground truth (the M20_GT_LOC role: bringup
-                                                   publishes a static identity map->odom)
+  /odom (odom -> base_link) + TF odom->base_link   GODOT_ODOM=truth (default): ground truth (the M20_GT_LOC role:
+                                                   bringup publishes a static identity map->odom).
+                                                   GODOT_ODOM=drift: dead-reckoned odometry that drifts like a real
+                                                   robot's (godot_io.DriftOdom), seeded at the true pose, for AMCL
+                                                   to correct. Re-seeded on a sim reset (a teleport: > 0.3 m beyond what 1 m/s explains). A reset
+                                                   is invisible to AMCL: re-initialize it (/initialpose), as the eval does.
   /odom_true (map -> base_link_true, full 3D)      for the detector, Viser and nlnav
   /IMU_DATA, /JOINTS_DATA (drdds)                  the commander's tip-over failsafe; Viser's legs
   /LIDAR/POINTS (PointCloud2 xyz, base_link)       both hemispherical lidars (-> /scan)
@@ -26,9 +30,11 @@ Consumed:
 Env: GODOT_HOST (127.0.0.1), GODOT_API_PORT (7799), GODOT_VIDEO_PORT (7800), GODOT_DEPTH_PORT (7802),
 GODOT_LIDAR_PORT (7803), GODOT_POSE_HZ (50), GODOT_CAM_HZ (10), GODOT_VMAX (0.5), GODOT_WMAX (1.5),
 GODOT_CLOUD_ZBAND (-0.45,0.70: base_link z kept in /LIDAR/POINTS),
-GODOT_DEPTH_OBSTACLES (1).
+GODOT_DEPTH_OBSTACLES (1), GODOT_ODOM (truth | drift), GODOT_ODOM_SEED (0), GODOT_ODOM_GYRO_BIAS (0.002 rad/s),
+GODOT_ODOM_SPEED_NOISE (0.02), GODOT_ODOM_SCALE (1.0).
 """
 import array
+import math
 import os
 import socket
 import sys
@@ -63,6 +69,8 @@ CMD_STALE_S = 0.5
 # Only points the scan converter can use (pointcloud_to_laserscan keeps -0.36..0.54 m around
 # base_link), with margin: the full sweeps are ~155k points, this is ~10x fewer.
 ZBAND = tuple(float(v) for v in os.environ.get("GODOT_CLOUD_ZBAND", "-0.45,0.70").split(","))
+ODOM_MODE = os.environ.get("GODOT_ODOM", "truth")
+RESEED_JUMP_M = 0.3            # true pose moved this much more than 1 m/s could explain since the last tick = a sim reset
 
 
 def u8(arr) -> array.array:
@@ -117,6 +125,12 @@ class GodotBridge(Node):
         self.gyro_z, self.trim, self.last_tick = 0.0, gio.YawTrim(), time.monotonic()
         self.sim_ok, self.sim_err = True, ""
         self.state_stamp = None                        # stamp of the last published pose/TF (sensor_stamp)
+        self.drift = (gio.DriftOdom(seed=int(os.environ.get("GODOT_ODOM_SEED", 0)),
+                                    speed_noise=float(os.environ.get("GODOT_ODOM_SPEED_NOISE", 0.02)),
+                                    gyro_bias=float(os.environ.get("GODOT_ODOM_GYRO_BIAS", 0.002)),
+                                    scale=float(os.environ.get("GODOT_ODOM_SCALE", 1.0)))
+                      if ODOM_MODE == "drift" else None)
+        self._last_true_xy, self._last_odom_t = None, None
         self.lock = threading.Lock()
         self.latest_lidar = {}                         # index -> points (in the z band)
         self.frames = {"c": {}, "d": {}}               # seq -> (header, pixels): newest few only
@@ -197,15 +211,16 @@ class GodotBridge(Node):
         self.gyro_z = float(gyro[2])
         accel = imu.get("accel", [0.0, 0.0, 9.81])
 
+        ox, oy, oyaw = self._odom_pose(px, py, yaw, float(v_body[0]))
         od = Odometry()
         od.header.stamp, od.header.frame_id, od.child_frame_id = now, "odom", "base_link"
-        od.pose.pose.position.x, od.pose.pose.position.y = float(px), float(py)
-        od.pose.pose.orientation.z, od.pose.pose.orientation.w = float(np.sin(yaw / 2)), float(np.cos(yaw / 2))
+        od.pose.pose.position.x, od.pose.pose.position.y = float(ox), float(oy)
+        od.pose.pose.orientation.z, od.pose.pose.orientation.w = float(np.sin(oyaw / 2)), float(np.cos(oyaw / 2))
         od.twist.twist.linear.x, od.twist.twist.angular.z = float(v_body[0]), float(gyro[2])
         self.odom_pub.publish(od)
         tf = TransformStamped()
         tf.header.stamp, tf.header.frame_id, tf.child_frame_id = now, "odom", "base_link"
-        tf.transform.translation.x, tf.transform.translation.y = float(px), float(py)
+        tf.transform.translation.x, tf.transform.translation.y = float(ox), float(oy)
         tf.transform.rotation.z, tf.transform.rotation.w = od.pose.pose.orientation.z, od.pose.pose.orientation.w
         self.tf_bc.sendTransform(tf)
         # Only now may sensors use this stamp (see publish_camera): set before sendTransform, a camera/lidar
@@ -235,6 +250,24 @@ class GodotBridge(Node):
                 e, j = jd.data.joints_data[i], joints[i]
                 e.position, e.velocity, e.torque = float(j["q"]), float(j["dq"]), float(j["tau"])
             self.jd_pub.publish(jd)
+
+    def _odom_pose(self, px, py, yaw, v_forward):
+        """The pose /odom and TF odom->base_link carry: truth, or (GODOT_ODOM=drift) dead reckoning."""
+        if self.drift is None:
+            return px, py, yaw
+        now = time.monotonic()
+        jumped = (self._last_true_xy is not None and
+                  math.hypot(px - self._last_true_xy[0], py - self._last_true_xy[1])
+                  > RESEED_JUMP_M + 1.0 * (now - self._last_odom_t))
+        if self.drift.pose is None or jumped:
+            self.drift.reset(px, py, yaw)
+            self.get_logger().info(f"odometry (drift) seeded at the true pose ({px:.2f}, {py:.2f}, {yaw:.2f})"
+                                   + (" after a sim reset" if jumped else ""))
+            pose = self.drift.pose
+        else:
+            pose = self.drift.step(v_forward, yaw, now - self._last_odom_t)
+        self._last_true_xy, self._last_odom_t = (px, py), now
+        return pose
 
     # ---------------------------------------------------------------- stream readers
     # Readers ONLY drain the sockets and keep the newest frame: the sim sends from its main thread,

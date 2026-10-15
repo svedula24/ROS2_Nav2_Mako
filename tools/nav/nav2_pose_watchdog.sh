@@ -44,7 +44,9 @@ backtrace() {   # $1 = process name
 }
 
 relaunch_nav2() {
-  docker exec "$C" bash -lc "cp /cfg/out/nav2.log /cfg/out/nav2_frozen_$(date +%H%M%S).log 2>/dev/null; ps -eo pid,args | grep -E 'nav2_|navigation_launch|lifecycle_manager' | grep -vE 'grep|map_server|lifecycle_manager_map' | awk '{print \$1}' | xargs -r kill -9; sleep 2"
+  # kills Nav2 only: the map server and localization (AMCL + its lifecycle manager, --loc amcl) keep running, since
+  # navigation_launch.py restarts neither, and without AMCL there would be no map->odom
+  docker exec "$C" bash -lc "cp /cfg/out/nav2.log /cfg/out/nav2_frozen_$(date +%H%M%S).log 2>/dev/null; ps -eo pid,args | grep -E 'nav2_|navigation_launch|lifecycle_manager' | grep -vE 'grep|map_server|lifecycle_manager_map|nav2_amcl|lifecycle_manager_localization' | awk '{print \$1}' | xargs -r kill -9; sleep 2"
   local t0; t0=$(date +%s)
   docker exec -d "$C" bash -lc "$SRC; ros2 launch nav2_bringup navigation_launch.py params_file:=/cfg/nav2_params.yaml use_sim_time:=false >/cfg/out/nav2.log 2>&1"
   for i in $(seq 1 90); do

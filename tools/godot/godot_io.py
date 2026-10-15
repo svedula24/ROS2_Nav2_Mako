@@ -217,6 +217,46 @@ class YawTrim:
         return max(-self.out_max, min(self.out_max, out))
 
 
+class DriftOdom:
+    """Dead-reckoned odometry that drifts like a real robot's, for testing localization (AMCL) against the sim.
+
+    Same model as tools/mujoco_sim.py's odometry:
+      heading += true yaw change + gyro_bias·dt + N(0, gyro_noise)     a gyro: right rate, a small bias, noise
+      distance = forward speed · scale · (1 + N(0, speed_noise)) · dt   legs/encoders: slip noise + scale error
+    Heading error accumulates (bias · time while moving), and turns that into position error that grows with
+    distance, which is what a localizer has to correct. Deterministic for a given seed. The pose starts wherever
+    reset() puts it.
+    Standing still (speed < STILL_V and turn rate < STILL_W) adds no bias or noise: a zero-velocity update, as real
+    state estimators do. Without it the heading drifts ~7 deg/min while parked, and AMCL can't fix that because it
+    only updates after the robot moves (update_min_d / update_min_a)."""
+
+    STILL_V, STILL_W = 0.02, 0.02              # m/s, rad/s
+
+    def __init__(self, seed=0, speed_noise=0.02, gyro_bias=0.002, gyro_noise=0.0005, scale=1.0):
+        self.rng = np.random.default_rng(seed)
+        self.speed_noise, self.gyro_bias, self.gyro_noise, self.scale = speed_noise, gyro_bias, gyro_noise, scale
+        self.pose = None                       # (x, y, yaw) in the odom frame
+        self._prev_true_yaw = None
+
+    def reset(self, x, y, yaw):
+        self.pose, self._prev_true_yaw = (float(x), float(y), float(yaw)), float(yaw)
+
+    def step(self, v_forward, true_yaw, dt):
+        """Advance by dt seconds given the body's forward speed and the TRUE yaw now. -> (x, y, yaw)."""
+        x, y, th = self.pose
+        dyaw = math.atan2(math.sin(true_yaw - self._prev_true_yaw), math.cos(true_yaw - self._prev_true_yaw))
+        self._prev_true_yaw = true_yaw
+        if abs(v_forward) < self.STILL_V and abs(dyaw) < self.STILL_W * max(dt, 1e-6):   # standing still
+            th = math.atan2(math.sin(th + dyaw), math.cos(th + dyaw))
+            self.pose = (x, y, th)
+            return self.pose
+        th = th + dyaw + self.gyro_bias * dt + (self.rng.normal(0.0, self.gyro_noise) if self.gyro_noise else 0.0)
+        th = math.atan2(math.sin(th), math.cos(th))
+        v = v_forward * self.scale * (1.0 + (self.rng.normal(0.0, self.speed_noise) if self.speed_noise else 0.0))
+        self.pose = (x + v * math.cos(th) * dt, y + v * math.sin(th) * dt, th)
+        return self.pose
+
+
 def body_velocity(q, vel_enu):
     """World (ENU) linear velocity -> base_link frame."""
     return quat_to_mat(*q).T @ np.asarray(vel_enu, float)

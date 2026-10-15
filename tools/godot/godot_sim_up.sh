@@ -9,6 +9,9 @@
 #   bash tools/godot/godot_sim_up.sh --no-site-map   live costmaps only (no Nav2 static map)
 #   bash tools/godot/godot_sim_up.sh --object-map <json>   default ~/m20_sim/semmap/circuit4/object_map.json
 #   bash tools/godot/godot_sim_up.sh --stop-sim   also quit the Godot sim on exit
+#   bash tools/godot/godot_sim_up.sh --loc amcl   localize with AMCL on the site map from DRIFTING odometry
+#                                                 (default --loc gt: the sim's ground-truth pose, demo only;
+#                                                  --loc odom: drifting odometry, NO correction: an eval baseline)
 #   then:  tools/dev/m20 say "go to the ladder"
 # The local LLM (Ollama, NLNAV_LLM_MODEL, default qwen2.5:7b-instruct) runs in m20_ollama and is kept
 # running between launches (the model stays loaded); NLNAV_LLM=claude switches to the Anthropic API.
@@ -23,7 +26,7 @@ GODOT_SIM="${GODOT_SIM:-$(dirname "$REPO")/stateful-drone-sim}"
 SITE="${GODOT_SITE:-circuit4_cam_mesh}"
 SCENE="godot_circuit4.xml"                      # tools/sim/godot_circuit4.scene.yaml (waypoints, splat frame)
 PORT="${VIEW_PORT:-8080}"
-VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"
+VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"; LOC="${M20_LOC:-gt}"
 OBJECT_MAP="$HOME/m20_sim/semmap/circuit4/object_map.json"
 LLM="${NLNAV_LLM:-ollama}"; LLM_MODEL="${NLNAV_LLM_MODEL:-qwen2.5:7b-instruct}"
 while [ $# -gt 0 ]; do
@@ -33,11 +36,21 @@ while [ $# -gt 0 ]; do
     --detect) DETECT=1 ;;
     --no-site-map) SITE_MAP="" ;;
     --object-map) OBJECT_MAP="$2"; shift ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --loc) LOC="$2"; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option $1 (see --help)"; exit 2 ;;
   esac
   shift
 done
+case "$LOC" in
+  gt) ODOM=truth; GT_LOC=1; POSE_SOURCE=odom_true ;;
+  odom) ODOM=drift; GT_LOC=1; POSE_SOURCE=tf ;;   # baseline: drifting odometry, map->odom fixed at identity
+  amcl) ODOM=drift; GT_LOC=0; POSE_SOURCE=tf
+        [ -n "$SITE_MAP" ] || { echo "ERROR: --loc amcl needs the site map (drop --no-site-map)"; exit 2; } ;;
+  *) echo "unknown --loc $LOC (gt | amcl | odom)"; exit 2 ;;
+esac
+# the spawn = the scene's "start" waypoint: AMCL's initial pose
+START_POSE=$(sed -n 's/^ *start: *\[\(.*\)\].*/\1/p' "$REPO/tools/sim/${SCENE%.xml}.scene.yaml" | tr -d ' ' | tr ',' ' ')
 
 api_up() { python3 - <<'PY'
 import socket, sys
@@ -93,14 +106,25 @@ echo "[godot_sim_up] starting the Godot ROS bridge"
 docker rm -f m20_godot_bridge >/dev/null 2>&1 || true
 docker run -d --name m20_godot_bridge --network host --ipc host \
   -e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUNBUFFERED=1 \
-  -e GODOT_VMAX="${GODOT_VMAX:-0.5}" -e GODOT_DEPTH_OBSTACLES="${GODOT_DEPTH_OBSTACLES:-1}" \
+  -e GODOT_VMAX="${GODOT_VMAX:-0.5}" -e GODOT_DEPTH_OBSTACLES="${GODOT_DEPTH_OBSTACLES:-1}" -e GODOT_ODOM="$ODOM" \
   -v "$REPO/tools/godot":/godot:ro \
   m20_sim:latest bash -lc "source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; python3 /godot/godot_bridge.py" >/dev/null
 sleep 6
 
-# 3. the usual stack, minus the MuJoCo pieces (bringup M20_EXTERNAL_SIM=1); ground-truth localisation
+# AMCL starts from the KNOWN spawn, so put the robot there first (a reused sim may have it anywhere)
+if [ "$LOC" != gt ]; then      # also odom: drift is seeded at the true pose and map->odom is the identity
+  python3 - <<'PY' || echo "[godot_sim_up] WARNING: could not reset the sim to the spawn; AMCL's initial pose may be wrong"
+import json, socket, time
+s = socket.create_connection(("127.0.0.1", 7799), timeout=10); s.sendall(b'{"cmd":"reset"}\n'); s.recv(4096); s.close()
+time.sleep(3)
+PY
+fi
+
+# 3. the usual stack, minus the MuJoCo pieces (bringup M20_EXTERNAL_SIM=1); localization per --loc
 # NL navigation runs in its own container (step 4b: it needs OWLv2's text encoder), not the commander.
-M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=1 M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
+echo "[godot_sim_up] localization: $LOC (odometry: $ODOM$( [ "$LOC" = amcl ] && echo ", initial pose $START_POSE"))"
+M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=$GT_LOC M20_LOC=$LOC M20_START_POSE="$START_POSE" \
+M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
 M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="${GODOT_VMAX:-0.5}" bash "$REPO/tools/nav/bringup_plan_a.sh"
 # the mission server (m20 say / goto) needs ASSISTED; bringup leaves TELEOP
 SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
@@ -127,7 +151,7 @@ fi
 echo "[godot_sim_up] starting NL navigation (llm=$LLM, model=$LLM_MODEL)"
 # tools/godot/nlnav_up.sh owns the container start (tools/nlnav_eval/eval.sh restarts it with another model)
 bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "$SCENE" --llm "$LLM" --model "$LLM_MODEL" \
-  --min-label-score "${MIN_LABEL_SCORE:-0.4}" >/dev/null
+  --min-label-score "${MIN_LABEL_SCORE:-0.4}" --pose-source "$POSE_SOURCE" >/dev/null
 
 # 4b'. Nav2 robot-pose watchdog: relaunches nav2 if a costmap's published footprint stops updating (the
 # silent frozen-pose failure of 2026-10-13; see the script's header). Log + backtraces in ~/m20_sim/watchdog

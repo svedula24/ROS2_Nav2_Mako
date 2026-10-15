@@ -25,7 +25,7 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PolygonStamped
+from geometry_msgs.msg import PolygonStamped, PoseWithCovarianceStamped
 from m20_msgs.action import NavigateNL
 from m20_msgs.msg import FailsafeStatus, RobotMode
 from m20_msgs.srv import SetMode
@@ -80,6 +80,19 @@ class Eval(Node):
         self.tf = Buffer()
         self._tfl = TransformListener(self.tf, self)
         self.loc_err, self.loc_yaw_err, self.loc_n = 0.0, 0.0, 0
+        self.odom_err = 0.0                   # raw odometry drift: TF odom->base_link vs truth (odom is seeded at truth)
+        self.initial_pose = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 1)
+
+    def publish_initial_pose(self, start):
+        m = PoseWithCovarianceStamped()
+        m.header.frame_id, m.header.stamp = "map", self.get_clock().now().to_msg()
+        m.pose.pose.position.x, m.pose.pose.position.y = float(start[0]), float(start[1])
+        yaw = float(start[2]) if len(start) > 2 else 0.0
+        m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        cov = [0.0] * 36
+        cov[0], cov[7], cov[35] = 0.05 ** 2, 0.05 ** 2, math.radians(3) ** 2     # placed at a known spot
+        m.pose.covariance = cov
+        self.initial_pose.publish(m)
 
     def on_odom(self, m):
         r, p, y = rpy(m.pose.pose.orientation)
@@ -103,6 +116,14 @@ class Eval(Node):
             self.loc_err = max(self.loc_err, math.hypot(dx, dy))
             self.loc_yaw_err = max(self.loc_yaw_err, abs(dyaw))
             self.loc_n += 1
+        try:                                                  # odometry alone, before any map correction
+            o = self.tf.lookup_transform("odom", "base_link", Time.from_msg(m.header.stamp))
+        except Exception:
+            return
+        e = math.hypot(o.transform.translation.x - m.pose.pose.position.x,
+                       o.transform.translation.y - m.pose.pose.position.y)
+        with self.lock:
+            self.odom_err = max(self.odom_err, e)
 
     def on_fp(self, costmap, m):
         """Staleness = how long the footprint's stamp has NOT advanced, timed on this process's monotonic clock
@@ -129,7 +150,7 @@ class Eval(Node):
     def start_watch(self):
         with self.lock:
             self.watch, self.max_tilt, self.fp_age_max, self.failsafe = True, 0.0, 0.0, ""
-            self.loc_err, self.loc_yaw_err, self.loc_n = 0.0, 0.0, 0
+            self.loc_err, self.loc_yaw_err, self.loc_n, self.odom_err = 0.0, 0.0, 0, 0.0
 
     def stop_watch(self):
         with self.lock:
@@ -138,7 +159,7 @@ class Eval(Node):
             out = {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe}
             if self.loc_n:
                 out.update(loc_err_max_m=round(self.loc_err, 3), loc_yaw_err_max_deg=round(self.loc_yaw_err, 2),
-                           loc_samples=self.loc_n)
+                           odom_err_max_m=round(self.odom_err, 3), loc_samples=self.loc_n)
             return out
 
     def xy(self):
@@ -223,13 +244,17 @@ def failed_attempt(status, detail):
 
 
 def reset_robot(node, start):
-    """-> True once the ground-truth pose is within 0.3 m of the start (up to 10 s), else False."""
+    """-> True once the ground-truth pose is within 0.3 m of the start (up to 10 s), else False.
+    Then tells AMCL the robot is at the spawn (/initialpose), like an operator after placing the robot: a sim reset
+    is a teleport that odometry can't see. With ground-truth localization nothing listens and this is a no-op."""
     sim({"cmd": "reset"})
     for _ in range(100):                                      # wait for the GT pose to show the spawn
         node.spin_for(0.1)
         xy = node.xy()
         if xy and math.hypot(xy[0] - start[0], xy[1] - start[1]) < 0.3:
             node.spin_for(1.0)
+            node.publish_initial_pose(start)
+            node.spin_for(2.0)                                # AMCL re-initializes on its next scan
             return True
     return False
 
@@ -318,7 +343,7 @@ def main():
                 r, wall, out = node.say(c["text"], True, limit_s=60.0)
                 att.update(result_dict(r, wall) if r is not None else failed_attempt(out, f"dry-run goal {out}"))
             att["t_end"] = time.time()
-            att["pass"], att["why"] = judge(c["expect"], att, objects)
+            att["pass"], att["why"] = judge(c["expect"], att, objects, run["config"].get("localization"))
             rec["attempts"].append(att)
             print(f"[eval] {c['name']:<26} {'PASS' if att['pass'] else 'FAIL'}  {att['status']:<14} "
                   f"{(att.get('latency_ms') or 0):6.0f} ms  {att['why'][:70]}", flush=True)

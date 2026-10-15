@@ -9,7 +9,9 @@ Serves m20_msgs/action/NavigateNL on /m20/nlnav/navigate:
 
 Inputs:  the site's object map (param object_map: format v1 JSON, tools/semmap/build_object_map.py;
            re-read when it changes)
-         odom (nav_msgs/Odometry, param odom_topic, default /odom_true in the sim)
+         the robot pose ("here"), param pose_source:
+           odom_true = nav_msgs/Odometry on param odom_topic (default /odom_true: the sim's ground truth)
+           tf        = TF map -> base_link, the pose Nav2 believes (AMCL); use this whenever localization is real
          Nav2's global costmap (get_costmap service per command; the topic as fallback)
          scene yaml `waypoints:` (param scene_yaml) = named places ("start", ...)
 Params:  llm (ollama | claude | json; env NLNAV_LLM overrides), text_encoder (owl | label),
@@ -22,6 +24,7 @@ import threading
 import time
 
 import rclpy
+import rclpy.time
 import yaml
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -55,7 +58,8 @@ class NLNavNode(Node):
                               ("costmap_service", "/global_costmap/get_costmap"),
                               ("llm", os.environ.get("NLNAV_LLM", "ollama")), ("text_encoder", "owl"),
                               ("threshold", 0.10), ("reach_check", True),
-                              ("min_label_score", 0.4), ("min_object_score", 0.0)):
+                              ("min_label_score", 0.4), ("min_object_score", 0.0),
+                              ("pose_source", "odom_true"), ("map_frame", "map"), ("base_frame", "base_link")):
             self.declare_parameter(name, default)
         p = lambda n: self.get_parameter(n).value
         self.scene_yaml, self.map_path = p("scene_yaml"), p("object_map")
@@ -74,8 +78,18 @@ class NLNavNode(Node):
         self.omap, self.map_mtime = ObjectMap(), None
         self.active = None                     # (RunMission goal handle) of OUR running mission
 
-        self.create_subscription(Odometry, p("odom_topic"), self.on_odom, qos_profile_sensor_data,
-                                 callback_group=self.cb)
+        self.pose_source = p("pose_source")
+        if self.pose_source == "tf":           # believed pose: same source as Nav2's planner/controller
+            import tf2_ros
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+            self.frames = (p("map_frame"), p("base_frame"))
+            self.create_timer(0.1, self.on_tf_tick, callback_group=self.cb)
+        elif self.pose_source == "odom_true":
+            self.create_subscription(Odometry, p("odom_topic"), self.on_odom, qos_profile_sensor_data,
+                                     callback_group=self.cb)
+        else:
+            raise ValueError(f"pose_source must be odom_true or tf, got {self.pose_source!r}")
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(OccupancyGrid, p("costmap_topic"), self.on_costmap, latched,
@@ -97,7 +111,7 @@ class NLNavNode(Node):
         self.get_logger().info(
             f"NL navigation (offline phase) up: llm={self.backend.name}, encoder={self.encoder_kind}, "
             f"{len(self.omap.objects)} objects from {self.map_path or '(no object map)'}, "
-            f"{len(self.waypoints)} named places")
+            f"{len(self.waypoints)} named places, pose from {self.pose_source}")
         threading.Thread(target=self.warm_up, daemon=True).start()
 
     def warm_up(self):
@@ -120,6 +134,15 @@ class NLNavNode(Node):
         q = m.pose.pose.orientation
         with self.lock:
             self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, yaw_of(q))
+
+    def on_tf_tick(self):
+        try:                                   # latest available map -> base_link (Time() = newest)
+            t = self.tf_buffer.lookup_transform(self.frames[0], self.frames[1], rclpy.time.Time())
+        except Exception:                      # not yet localized / TF not up: keep the last pose (or None)
+            return
+        tr, q = t.transform.translation, t.transform.rotation
+        with self.lock:
+            self.pose = (tr.x, tr.y, yaw_of(q))
 
     def on_costmap(self, m):
         g = grid_from_msg(m.info.width, m.info.height, m.info.resolution,

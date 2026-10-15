@@ -10,8 +10,10 @@ def _norm(label):
     return (label or "").split(" #")[0].strip().lower()
 
 
-def judge(expect: dict, attempt: dict, objects: dict = None):
-    """objects: {id: (x, y)} map positions for drive-level `near_id` checks."""
+def judge(expect: dict, attempt: dict, objects: dict = None, localization: str = None):
+    """objects: {id: (x, y)} map positions for drive-level `near_id` checks.
+    localization: the run's localization mode (eval.sh config): gt | amcl | odom. Under "odom" (drifting odometry, no
+    correction: the baseline that shows what drift does) the localization limits are recorded, not judged."""
     why = []
     st = attempt.get("status")
     if st != expect.get("status"):
@@ -79,11 +81,16 @@ def judge(expect: dict, attempt: dict, objects: dict = None):
         return False, f"nav2 pose froze (footprint age {attempt['max_footprint_age_s']:.1f} s)"
     if attempt.get("failsafe"):
         return False, f"commander failsafe: {attempt['failsafe']}"
-    if "max_loc_err_m" in expect:                       # SCAFFOLD: localization (AMCL) vs ground truth
-        err = attempt.get("loc_err_max_m")
+    if "max_loc_err_m" in expect or "max_loc_yaw_deg" in expect:   # localization: believed pose vs ground truth
+        err, yaw = attempt.get("loc_err_max_m"), attempt.get("loc_yaw_err_max_deg")
         if err is None:
             return False, "no localization samples (TF map->base_link vs /odom_true)"
-        if err > expect["max_loc_err_m"]:
-            return False, f"localization off by {err:.2f} m (limit {expect['max_loc_err_m']})"
-        why.append(f"localized within {err:.2f} m")
+        if localization == "odom":
+            why.append(f"uncorrected odometry: believed pose off by up to {err:.2f} m / {yaw or 0:.0f} deg (not judged)")
+        else:
+            if err > expect.get("max_loc_err_m", math.inf):
+                return False, f"localization off by {err:.2f} m (limit {expect['max_loc_err_m']})"
+            if yaw is not None and yaw > expect.get("max_loc_yaw_deg", math.inf):
+                return False, f"localization heading off by {yaw:.1f} deg (limit {expect['max_loc_yaw_deg']})"
+            why.append(f"localized within {err:.2f} m / {yaw or 0:.1f} deg")
     return True, "; ".join(why) or "ok"

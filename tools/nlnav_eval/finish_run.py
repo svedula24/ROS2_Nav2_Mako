@@ -43,8 +43,9 @@ for c in run["cases"]:
           f"{med([(a.get('timing') or {}).get('llm_ms') for a in att]):>7} {med([(a.get('timing') or {}).get('resolve_ms') for a in att]):>8}  {att[-1]['why'][:60]}")
     loc = [a.get("loc_err_max_m") for a in att if a.get("loc_err_max_m") is not None]
     if loc:
+        odom = [a.get("odom_err_max_m") for a in att if a.get("odom_err_max_m") is not None]
         print(f"{'':<32} localization: max error {max(loc):.2f} m, yaw {max(a.get('loc_yaw_err_max_deg') or 0 for a in att):.1f} deg "
-              f"(believed pose vs ground truth)")
+              f"(believed pose vs ground truth)" + (f"; raw odometry drift up to {max(odom):.2f} m" if odom else ""))
 v = [verdict(c) for c in run["cases"]]
 known = [c for c in run["cases"] if c.get("known_issue")]
 print(f"{v.count('PASS')}/{len(v) - len(known)} pass (excluding known issues); NEW FAILURES: {v.count('FAIL')}; "

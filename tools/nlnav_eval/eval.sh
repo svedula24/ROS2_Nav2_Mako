@@ -31,10 +31,16 @@ if [ -n "$MODEL" ]; then
   bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "godot_$SITE" --model "$MODEL" --wait
 fi
 # configuration block: what this run was measured with
+# localization: odometry from the bridge's GODOT_ODOM; corrected by AMCL if it runs (gt = truth odom, no AMCL;
+# odom = drifting odom, no correction; amcl = drifting odom + AMCL)
+ODOM=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' m20_godot_bridge 2>/dev/null | sed -n 's/^GODOT_ODOM=//p')
+ODOM=${ODOM:-truth}
+if docker exec $C pgrep -f nav2_amcl >/dev/null 2>&1; then LOCMODE=amcl; elif [ "$ODOM" = drift ]; then LOCMODE=odom; else LOCMODE=gt; fi
 CFG=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' m20_nlnav | python3 -c "
 import sys, json, os, subprocess
 env = dict(l.split('=', 1) for l in sys.stdin.read().split() if '=' in l)
 cfg = {'llm': env.get('NLNAV_LLM'), 'model': env.get('NLNAV_LLM_MODEL'), 'encoder': 'owl',
+       'localization': '$LOCMODE', 'odom': '$ODOM',
        'object_map_bytes': os.path.getsize('$OBJECT_MAP') if os.path.exists('$OBJECT_MAP') else 0,
        'git': subprocess.run(['git', '-C', '$REPO', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()}
 print(json.dumps(cfg))")

@@ -2,12 +2,12 @@
 # (Re)start the NL navigation container (m20_nlnav) on the Godot stack. Used by godot_sim_up.sh at bringup and by
 # tools/nlnav_eval/eval.sh to swap the LLM between runs.
 #   bash tools/godot/nlnav_up.sh --object-map ~/m20_sim/semmap/circuit4/object_map.json --scene godot_circuit4
-#        [--llm ollama|claude|json] [--model qwen2.5:7b-instruct] [--min-label-score 0.4] [--wait]
+#        [--llm ollama|claude|json] [--model qwen2.5:7b-instruct] [--min-label-score 0.4] [--pose-source odom_true|tf] [--wait]
 # --wait blocks until the node logs "warm-up done" (text encoder + one real LLM parse), up to 3 min.
 set -e
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 LLM="${NLNAV_LLM:-ollama}"; MODEL="${NLNAV_LLM_MODEL:-qwen2.5:7b-instruct}"; MIN_LABEL="${MIN_LABEL_SCORE:-0.4}"
-OBJECT_MAP=""; SCENE=""; WAIT=0
+OBJECT_MAP=""; SCENE=""; WAIT=0; POSE_SOURCE="${NLNAV_POSE_SOURCE:-odom_true}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --object-map) OBJECT_MAP="$2"; shift ;;
@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do
     --llm) LLM="$2"; shift ;;
     --model) MODEL="$2"; shift ;;
     --min-label-score) MIN_LABEL="$2"; shift ;;
+    --pose-source) POSE_SOURCE="$2"; shift ;;
     --wait) WAIT=1 ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
@@ -28,7 +29,7 @@ NL_ENV=(-e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUN
 NL_CMD="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export PYTHONPATH=/nlnav:\$PYTHONPATH;"
 NL_CMD+=" python3 -c 'from m20_nlnav.nlnav_node import main; main()' --ros-args"
 NL_CMD+=" -p scene_yaml:=/scene/${SCENE%.xml}.scene.yaml -p object_map:=/semmap/$(basename "$OBJECT_MAP")"
-NL_CMD+=" -p llm:=$LLM -p text_encoder:=owl -p min_label_score:=$MIN_LABEL"
+NL_CMD+=" -p llm:=$LLM -p text_encoder:=owl -p min_label_score:=$MIN_LABEL -p pose_source:=$POSE_SOURCE"
 docker rm -f m20_nlnav >/dev/null 2>&1 || true
 docker run -d --name m20_nlnav --network host --ipc host "${NL_ENV[@]}" \
   -v "$REPO/src/m20_nlnav":/nlnav:ro -v "$REPO/tools/sim":/scene:ro -v "$(dirname "$OBJECT_MAP")":/semmap:ro \

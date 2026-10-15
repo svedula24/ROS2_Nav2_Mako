@@ -78,3 +78,18 @@ def test_judge_localization_scaffold():
     assert judge(e, dict(base, loc_err_max_m=0.12))[0]
     assert not judge(e, dict(base, loc_err_max_m=0.5))[0]
     assert not judge(e, base)[0]
+
+
+def test_judge_localization_heading_and_modes():
+    """max_loc_yaw_deg fails a pose that is close but pointing the wrong way; the uncorrected-odometry baseline
+    (localization "odom") records the error without judging it; gt / amcl judge it."""
+    e = {"status": "done", "max_loc_err_m": 0.35, "max_loc_yaw_deg": 10}
+    base = {"status": "done", "items": []}
+    good, turned, lost = (dict(base, loc_err_max_m=0.1, loc_yaw_err_max_deg=yaw) for yaw in (3.0, 25.0, 3.0))
+    lost["loc_err_max_m"] = 2.4
+    assert judge(e, good, localization="amcl")[0]
+    ok, why = judge(e, turned, localization="amcl")
+    assert not ok and "heading" in why
+    assert not judge(e, lost, localization="gt")[0]
+    ok, why = judge(e, lost, localization="odom")
+    assert ok and "not judged" in why and "2.40" in why

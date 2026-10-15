@@ -117,3 +117,55 @@ def test_vel_body_sign_and_caps():
     c = g.vel_body_cmd(2.0, -9.0, vmax=0.5, wmax=1.5)
     assert c["forward"] == 0.5 and abs(c["yaw_rate_dps"] - math.degrees(1.5)) < 1e-9
     assert g.vel_body_cmd(-2.0, 0)["forward"] == -0.5
+
+
+# ---- DriftOdom: dead-reckoned odometry for localization (AMCL) tests ----
+def _drive(odom, v, yaw_rate, secs, dt=0.02, yaw0=0.0):
+    """Feed DriftOdom a robot moving at v m/s, turning at yaw_rate rad/s (the TRUE yaw it would see)."""
+    yaw = yaw0
+    for _ in range(int(round(secs / dt))):
+        yaw += yaw_rate * dt
+        pose = odom.step(v, yaw, dt)
+    return pose, yaw
+
+
+def test_drift_odom_without_noise_is_exact_dead_reckoning():
+    o = g.DriftOdom(speed_noise=0.0, gyro_bias=0.0, gyro_noise=0.0)
+    o.reset(1.0, 2.0, 0.0)
+    (x, y, th), _ = _drive(o, 0.5, 0.0, 10.0)                 # straight, 10 s at 0.5 m/s along +x
+    assert abs(x - 6.0) < 1e-9 and abs(y - 2.0) < 1e-9 and abs(th) < 1e-12
+
+
+def test_drift_odom_gyro_bias_grows_heading_error_linearly():
+    o = g.DriftOdom(speed_noise=0.0, gyro_bias=0.002, gyro_noise=0.0)
+    o.reset(0.0, 0.0, 0.0)
+    (_, _, th), true_yaw = _drive(o, 0.3, 0.0, 60.0)          # walking straight for a minute
+    assert abs((th - true_yaw) - 0.002 * 60.0) < 1e-6        # 0.12 rad: bias x time
+
+
+def test_drift_odom_standing_still_does_not_drift():
+    o = g.DriftOdom()                                        # full noise + bias
+    o.reset(1.0, 2.0, 0.5)
+    (x, y, th), true_yaw = _drive(o, 0.0, 0.0, 600.0, yaw0=0.5)   # parked for 10 minutes
+    assert (x, y) == (1.0, 2.0) and abs(th - true_yaw) < 1e-12
+
+
+def test_drift_odom_scale_error_and_reproducible_noise():
+    o = g.DriftOdom(speed_noise=0.0, gyro_bias=0.0, gyro_noise=0.0, scale=1.05)
+    o.reset(0.0, 0.0, 0.0)
+    (x, _, _), _ = _drive(o, 1.0, 0.0, 10.0)
+    assert abs(x - 10.5) < 1e-9                              # 5 % long
+    runs = []
+    for _ in range(2):
+        o = g.DriftOdom(seed=7)
+        o.reset(0.0, 0.0, 0.0)
+        runs.append(_drive(o, 0.5, 0.1, 20.0)[0])
+    assert runs[0] == runs[1]                                # same seed -> same drift
+
+
+def test_drift_odom_follows_true_turns_across_the_pi_wrap():
+    o = g.DriftOdom(speed_noise=0.0, gyro_bias=0.0, gyro_noise=0.0)
+    o.reset(0.0, 0.0, 3.0)
+    (_, _, th), true_yaw = _drive(o, 0.0, 0.5, 2.0, yaw0=3.0)  # turns through +pi
+    wrap = lambda a: math.atan2(math.sin(a), math.cos(a))
+    assert abs(wrap(th - true_yaw)) < 1e-9

@@ -369,6 +369,46 @@ PYEOF" | tail -1
     docker cp "$REPO/tools/nav/anchor_guardian.py" $C:/cfg/anchor_guardian.py
     docker exec -d $C bash -lc "$SRC; python3 /cfg/anchor_guardian.py >/cfg/out/guardian.log 2>&1"
   fi
+elif [ "${M20_LOC:-}" = "amcl" ]; then
+  # AMCL on the known site map (external sim only, 2026-10-14). The bridge publishes DRIFTING odometry
+  # (GODOT_ODOM=drift); AMCL matches /scan against the site map and publishes map->odom, so there is NO static
+  # map->odom here. Initial pose = M20_START_POSE ("x y yaw", the spawn), set through AMCL's own params.
+  [ "$EXTERNAL_SIM" = "1" ] && [ -n "${M20_SITE_MAP:-}" ] || { echo "ERROR: M20_LOC=amcl needs M20_EXTERNAL_SIM=1 and M20_SITE_MAP"; exit 1; }
+  read -r SX SY SYAW <<< "${M20_START_POSE:-0 0 0}"
+  echo "[4/7] AMCL localization on the site map (initial pose $SX $SY $SYAW)"
+  docker exec -i -e SX="$SX" -e SY="$SY" -e SYAW="$SYAW" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+cfg["amcl"] = {"ros__parameters": {
+    "use_sim_time": False,
+    "global_frame_id": "map", "odom_frame_id": "odom", "base_frame_id": "base_link",
+    "scan_topic": "scan", "map_topic": "map", "first_map_only": False,
+    # motion model: how much the particles spread per metre / radian of odometry (rot-from-rot, rot-from-trans,
+    # trans-from-trans, trans-from-rot). 0.1: the drift model is ~2 % + 0.002 rad/s; Nav2's default 0.2 left the
+    # cloud ~0.3 m / 13 deg wide on circuit4 (2026-10-14) and the estimate wandered inside it in the long corridor.
+    "robot_model_type": "nav2_amcl::DifferentialMotionModel",
+    "alpha1": 0.1, "alpha2": 0.1, "alpha3": 0.1, "alpha4": 0.1, "alpha5": 0.1,
+    # sensor model: likelihood field = per beam, how far its endpoint lands from the nearest map obstacle.
+    # sigma_hit 0.1: 96 % of scan endpoints land within 0.10 m of the site map at the true pose (measured at the spawn)
+    "laser_model_type": "likelihood_field", "max_beams": 120, "laser_min_range": 0.5, "laser_max_range": 12.0,
+    "laser_likelihood_max_dist": 2.0, "sigma_hit": 0.1, "z_hit": 0.5, "z_rand": 0.5, "z_short": 0.05, "z_max": 0.05,
+    "lambda_short": 0.1, "do_beamskip": False,
+    "min_particles": 500, "max_particles": 2000, "pf_err": 0.05, "pf_z": 0.99, "resample_interval": 1,
+    "recovery_alpha_fast": 0.0, "recovery_alpha_slow": 0.0,
+    "update_min_d": 0.1, "update_min_a": 0.1,                 # filter update every 0.1 m or 0.1 rad of motion
+    "tf_broadcast": True, "transform_tolerance": 1.0, "save_pose_rate": 0.5,
+    "set_initial_pose": True, "always_reset_initial_pose": False,
+    "initial_pose": {"x": float(os.environ["SX"]), "y": float(os.environ["SY"]), "z": 0.0,
+                     "yaw": float(os.environ["SYAW"])},
+}}
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched: amcl block (likelihood field, 500-2000 particles, initial pose from M20_START_POSE)")
+PYEOF
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=/cfg/maps/site.yaml -p use_sim_time:=false >/cfg/out/map_server.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_amcl amcl --ros-args --params-file /cfg/nav2_params.yaml >/cfg/out/amcl.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_localization -p autostart:=true -p node_names:=\"['map_server', 'amcl']\" >/cfg/out/loc_lifecycle.log 2>&1"
+  sleep 4
 elif [ "${M20_GT_LOC:-0}" = "1" ]; then
   # DEMO-ONLY ground-truth localization: the sim publishes odom = truth (M20_GT_ODOM),
   # map->odom is a fixed identity, and no SLAM runs. Nav2 can't mislocalize; obstacles
