@@ -427,9 +427,76 @@ else
 fi
 sleep 6
 
+# Real-time B hook (tools/realtime_b/realtime_b_up.sh sets it; unset = unchanged): extra Nav2 behavior plugins, e.g.
+# M20_BEHAVIORS_EXTRA=drive_on_heading (the VLM's forward moves; the stock list is spin/backup/wait).
+if [ -n "${M20_BEHAVIORS_EXTRA:-}" ]; then
+  echo "[4.9/7] extra Nav2 behaviors: $M20_BEHAVIORS_EXTRA"
+  docker exec -i -e EXTRA="$M20_BEHAVIORS_EXTRA" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+b = cfg["behavior_server"]["ros__parameters"]
+for name in os.environ["EXTRA"].split(","):
+    name = name.strip()
+    if name and name not in b["behavior_plugins"]:
+        b["behavior_plugins"].append(name)
+        b[name] = {"plugin": "nav2_behaviors/" + "".join(w.capitalize() for w in name.split("_"))}
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched: behavior_plugins =", b["behavior_plugins"])
+PYEOF
+fi
+
 echo "[5/7] starting Nav2 (logs -> /cfg/out/nav2.log; the 2026-07-17 lesson)"
 docker exec -d $C bash -lc "$SRC; ros2 launch nav2_bringup navigation_launch.py params_file:=/cfg/nav2_params.yaml use_sim_time:=false >/cfg/out/nav2.log 2>&1"
 sleep 14
+
+# Real-time B hook: collision_monitor between /cmd_vel and the robot (M20_COLLISION_MONITOR=1; the external-sim bridge
+# then reads /cmd_vel_safe via GODOT_CMD_TOPIC). One "approach" zone = the robot's own footprint simulated 1.2 s ahead
+# at the commanded velocity: any motion that would reach an obstacle sooner is slowed, in every direction, while
+# turning away stays possible (a fixed stop box around the body would also block turning away from a wall).
+if [ "${M20_COLLISION_MONITOR:-0}" = "1" ]; then
+  echo "[5.1/7] starting collision_monitor (/cmd_vel -> /cmd_vel_safe, footprint approach zone 1.2 s)"
+  docker exec -i $C bash -lc "cat > /cfg/collision_monitor.yaml" <<'YEOF'
+collision_monitor:
+  ros__parameters:
+    base_frame_id: base_link
+    odom_frame_id: odom
+    cmd_vel_in_topic: cmd_vel
+    cmd_vel_out_topic: cmd_vel_safe
+    transform_tolerance: 0.5
+    source_timeout: 5.0
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: polygon
+      action_type: approach
+      footprint_topic: /local_costmap/published_footprint
+      time_before_collision: 1.2
+      simulation_time_step: 0.1
+      max_points: 3
+      visualize: false
+    observation_sources: ["scan", "camera"]
+    scan:
+      type: scan
+      topic: /scan
+    camera:
+      type: pointcloud
+      topic: /camera/obstacle_points
+      min_height: -0.36
+      max_height: 0.54
+YEOF
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_collision_monitor collision_monitor --ros-args --params-file /cfg/collision_monitor.yaml >/cfg/out/collision_monitor.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_collision -p autostart:=true -p node_names:=\"['collision_monitor']\" >/cfg/out/collision_lifecycle.log 2>&1"
+  # it must really be active: with GODOT_CMD_TOPIC=/cmd_vel_safe and no monitor publishing it, the robot never moves
+  # (its lifecycle manager's log, not `ros2 lifecycle get`: the ros2 CLI's discovery can take > 5 s on this box)
+  CM_OK=0
+  for i in $(seq 1 20); do
+    docker exec $C grep -q "Managed nodes are active" /cfg/out/collision_lifecycle.log 2>/dev/null && { CM_OK=1; break; }
+    sleep 1
+  done
+  [ "$CM_OK" = "1" ] || { echo "ERROR: collision_monitor did not become active (see /cfg/out/collision_monitor.log)"; docker exec $C tail -20 /cfg/out/collision_monitor.log; exit 1; }
+  echo "  collision_monitor active"
+fi
 
 echo "[5.5/7] starting mission server (/m20/mission/run — tools/dev/m20 goto|mission)"
 docker exec -d $C bash -lc "$SRC; python3 /cfg/mission_server.py >/cfg/out/mission.log 2>&1"
