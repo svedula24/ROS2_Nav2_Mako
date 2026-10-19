@@ -427,6 +427,31 @@ else
 fi
 sleep 6
 
+# Exploration-map hook (M20_EXPLORE_MAP=1; unset = unchanged): the global costmap becomes the robot's own memory of an
+# UNSEEN site, VLFM-style: non-rolling, fixed to the site's extent, starting all-unknown and filling in from the global
+# costmap's own layers (obstacle_layer on /scan, camera_layer on the depth cloud) as the robot moves (track_unknown_space).
+# Frontiers = known-free cells next to unknown ones. The extent (M20_EXPLORE_ORIGIN "x y", M20_EXPLORE_SIZE "w h",
+# metres) must cover wherever the robot may go, INCLUDING odometry drift: the defaults are circuit4's (28 x 36 m with
+# ~4 m of margin); another site needs its own.
+if [ "${M20_EXPLORE_MAP:-0}" = "1" ]; then
+  echo "[4.8/7] exploration map: global costmap non-rolling, all-unknown at start, origin ${M20_EXPLORE_ORIGIN:--12 -16} size ${M20_EXPLORE_SIZE:-28 36} m"
+  docker exec -i -e ORIGIN="${M20_EXPLORE_ORIGIN:--12 -16}" -e SIZE="${M20_EXPLORE_SIZE:-28 36}" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+g = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
+ox, oy = (float(v) for v in os.environ["ORIGIN"].split()); w, h = (float(v) for v in os.environ["SIZE"].split())
+g["rolling_window"] = False
+g["width"], g["height"], g["origin_x"], g["origin_y"] = int(w), int(h), ox, oy
+g["resolution"] = 0.1
+g["track_unknown_space"] = True
+g["unknown_cost_value"] = 255
+g["plugins"] = [pl for pl in g["plugins"] if pl != "static_layer"]
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print(f"  patched: global costmap {w:.0f}x{h:.0f} m at ({ox}, {oy}), 0.1 m cells, unknown tracked, no static layer")
+PYEOF
+fi
+
 # Real-time B hook (tools/realtime_b/realtime_b_up.sh sets it; unset = unchanged): extra Nav2 behavior plugins, e.g.
 # M20_BEHAVIORS_EXTRA=drive_on_heading (the VLM's forward moves; the stock list is spin/backup/wait).
 if [ -n "${M20_BEHAVIORS_EXTRA:-}" ]; then

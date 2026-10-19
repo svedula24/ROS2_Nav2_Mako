@@ -56,17 +56,29 @@ def make_detector(dev):
         from transformers import Owlv2Processor, Owlv2ForObjectDetection
         proc = Owlv2Processor.from_pretrained(OWL_MODEL)
         model = Owlv2ForObjectDetection.from_pretrained(OWL_MODEL).eval().to(dev)
-        text = proc(text=[OFFICE], return_tensors="pt").to(dev)
+        # one (names, text) pair, swapped atomically by add_query and read once per frame: a query arriving
+        # mid-frame can never pair the old names with the new text
+        vocab = {"pair": (list(OFFICE), proc(text=[OFFICE], return_tensors="pt").to(dev))}
 
         def detect(rgb):
+            names, text = vocab["pair"]
             inp = proc(images=rgb, return_tensors="pt").to(dev)
             with torch.no_grad():
                 out = model(**inp, input_ids=text["input_ids"], attention_mask=text["attention_mask"])
             side = max(rgb.shape[:2])          # OWLv2 pads to a square: boxes are in that square
             r = proc.post_process_object_detection(out, threshold=DET_THR,
                                                    target_sizes=torch.tensor([[side, side]], device=dev))[0]
-            return [(OFFICE[l], float(s), tuple(b)) for b, l, s in
+            return [(names[l], float(s), tuple(b)) for b, l, s in
                     zip(r["boxes"].cpu().numpy(), r["labels"].cpu().numpy(), r["scores"].cpu().numpy())]
+
+        def add_query(phrase):             # open vocabulary at run time: a search target joins the query list
+            names = vocab["pair"][0]
+            if phrase and phrase not in names:
+                names = names + [phrase]
+                vocab["pair"] = (names, proc(text=[names], return_tensors="pt").to(dev))
+                return True
+            return False
+        detect.add_query = add_query
         return detect, f"OWLv2 office vocabulary ({len(OFFICE)} classes)"
 
     from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights as Wts
@@ -136,10 +148,10 @@ class ObjectMap:
 
 def main():
     import rclpy, cv2
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image
-    from std_msgs.msg import String
+    from std_msgs.msg import Empty, String
 
     dev = torch.device("cuda")
     detect, model_tag = make_detector(dev)
@@ -174,7 +186,23 @@ def main():
 
     node.create_subscription(Image, "/camera/image_raw", on_rgb, qos_profile_sensor_data)
     node.create_subscription(Image, "/camera/depth", on_depth, qos_profile_sensor_data)
-    node.create_subscription(Odometry, "/odom_true", on_odom, qos_profile_sensor_data)
+    # DET_POSE_TOPIC: the pose the 3D placement uses. /odom_true (ground truth) by default; the VLFM-style search sets
+    # /odom (the believed pose) so an unseen site is mapped the way a real robot would.
+    node.create_subscription(Odometry, os.environ.get("DET_POSE_TOPIC", "/odom_true"), on_odom, qos_profile_sensor_data)
+
+    def on_query(m):                      # /detections/query: add a phrase to the vocabulary (search targets)
+        if not hasattr(detect, "add_query"):
+            node.get_logger().warn(f"query {m.data.strip().lower()!r} ignored: DET_MODEL={DET_MODEL} has a fixed vocabulary")
+        elif detect.add_query(m.data.strip().lower()):
+            node.get_logger().info(f"query added: {m.data.strip().lower()!r}")
+    node.create_subscription(String, "/detections/query", on_query,
+                             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
+    def on_reset(_m):                     # /detections/reset: forget every object (a search starts from nothing)
+        with lock:                        # the main loop adds to / reads the map under the same lock
+            omap.objs, omap.next_id = [], 1
+        node.get_logger().info("object map reset")
+    node.create_subscription(Empty, "/detections/reset", on_reset, 10)
     pub_img = node.create_publisher(Image, "/detections/image", qos_profile_sensor_data)
     pub_obj = node.create_publisher(String, "/detections/objects", 10)
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
@@ -220,7 +248,8 @@ def main():
                         p_opt = np.array([(u - W / 2) / FX * z, (v - H / 2) / FX * z, z])
                         p_base = R_BASE_OPT @ p_opt + np.array([CAM_FWD, 0.0, CAM_UP])
                         xyz = (pose[1] + pose[2] @ p_base).tolist()
-                    omap.add(name, xyz, float(sc), size)
+                    with lock:
+                        omap.add(name, xyz, float(sc), size)
             det.append({"cls": name, "score": round(float(sc), 2),
                         "box": [int(x0), int(y0), int(x1), int(y1)],
                         "xyz": None if xyz is None else [round(v, 2) for v in xyz],
@@ -236,10 +265,11 @@ def main():
         im.height, im.width, im.encoding, im.step = H, W, "rgb8", W * 3
         im.data = img.tobytes()
         pub_img.publish(im)
-        pub_obj.publish(String(data=json.dumps({"frame": det, "objects": omap.confirmed()})))
+        with lock:
+            conf = omap.confirmed()
+        pub_obj.publish(String(data=json.dumps({"frame": det, "objects": conf})))
         n_frames += 1
         if time.time() - last_log > 15:
-            conf = omap.confirmed()
             by = {}
             for o in conf:
                 by[o["cls"]] = by.get(o["cls"], 0) + 1

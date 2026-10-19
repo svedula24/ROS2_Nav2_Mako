@@ -6,6 +6,7 @@
 #   tools/dev/m20 mission "X,Y" "X,Y" ...   ordered patrol of waypoints
 #   tools/dev/m20 say "go to the printer"   natural language (NavigateNL); --dry-run --pick ID
 #   tools/dev/m20 vlm "go to the ladder"    Real-time B: a VLM picks moves, no maps (tools/realtime_b); --dry-run | stop
+#   tools/dev/m20 search "refrigerator"   Real-time B search: VLFM-style frontiers + value map + OWLv2; --dry-run | stop
 #   tools/dev/m20 status                    mode / failsafe / behavior snapshot
 #
 # Everything runs inside the commander container; goals are map-frame meters.
@@ -114,7 +115,8 @@ for c in r.candidates[1:6]:
 sys.exit(0 if r.success else 2)
 PYEOF"
     ;;
-  vlm)
+  vlm|search)
+    ACTION=/m20/vlmnav/navigate; [ "$CMD" = search ] && ACTION=/m20/vlfm/navigate
     DRY=0; TEXT=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -123,10 +125,10 @@ PYEOF"
       esac
       shift
     done
-    [ -n "$TEXT" ] || { echo "usage: m20 vlm [--dry-run] \"go to the ladder\"   |   m20 vlm stop"; exit 1; }
+    [ -n "$TEXT" ] || { echo "usage: m20 $CMD [--dry-run] \"...\"   |   m20 $CMD stop"; exit 1; }
     if [ "$TEXT" = "stop" ]; then        # an empty CancelGoal request cancels every goal of the action
       # bounded and checked: an operator's stop must neither hang (Real-time B down) nor fake success
-      OUT=$(timeout 10 docker exec $C bash -lc "$SRC; timeout 5 ros2 service call /m20/vlmnav/navigate/_action/cancel_goal action_msgs/srv/CancelGoal '{}'" 2>&1); RC=$?
+      OUT=$(timeout 10 docker exec $C bash -lc "$SRC; timeout 5 ros2 service call $ACTION/_action/cancel_goal action_msgs/srv/CancelGoal '{}'" 2>&1); RC=$?
       if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "return_code=0"; then
         echo "STOP FAILED: Real-time B's action server did not answer (rc $RC). Is tools/realtime_b/realtime_b_up.sh up?"
         echo "$OUT" | tail -3; exit 2
@@ -134,7 +136,7 @@ PYEOF"
       echo "$OUT" | grep -q "goals_canceling=\[\]" && echo "stop: nothing was running" || echo "stop: episode canceling"
       exit 0
     fi
-    docker exec -i -e NL_TEXT="$TEXT" -e NL_DRY=$DRY $C bash -lc "$SRC; python3 - <<'PYEOF'
+    docker exec -i -e NL_TEXT="$TEXT" -e NL_DRY=$DRY -e NL_ACTION="$ACTION" $C bash -lc "$SRC; python3 - <<'PYEOF'
 import json, os, sys
 import rclpy
 from rclpy.action import ActionClient
@@ -142,9 +144,9 @@ from m20_msgs.action import NavigateNL
 
 rclpy.init()
 n = rclpy.create_node('m20_cli_vlm')
-cli = ActionClient(n, NavigateNL, '/m20/vlmnav/navigate')
+cli = ActionClient(n, NavigateNL, os.environ['NL_ACTION'])
 if not cli.wait_for_server(timeout_sec=5.0):
-    print('ERROR: Real-time B not running (tools/realtime_b/realtime_b_up.sh)'); sys.exit(1)
+    print('ERROR: ' + os.environ['NL_ACTION'] + ' not running (tools/realtime_b/realtime_b_up.sh --mode vlm|search)'); sys.exit(1)
 g = NavigateNL.Goal()
 g.text, g.dry_run, g.pick_id = os.environ['NL_TEXT'], os.environ['NL_DRY'] == '1', -1
 
@@ -157,7 +159,7 @@ send = cli.send_goal_async(g, feedback_callback=fb)
 rclpy.spin_until_future_complete(n, send, timeout_sec=10.0)
 gh = send.result()
 if gh is None or not gh.accepted:
-    print('REJECTED: an episode is already running (m20 vlm stop first), or the text is empty'); sys.exit(3)
+    print('REJECTED: an episode is already running (m20 ' + ('search' if '/vlfm/' in os.environ['NL_ACTION'] else 'vlm') + ' stop first), or the text is empty'); sys.exit(3)
 res = gh.get_result_async()
 rclpy.spin_until_future_complete(n, res)
 r = res.result().result
@@ -165,10 +167,17 @@ try:
     d = json.loads(r.detail) if r.detail.startswith('{') else {'detail': r.detail}
 except ValueError:
     d = {'detail': r.detail}
-print('%s: last move %s (%s; %s decisions, %s s, median decision %s ms)' % (
-    r.status, r.interpretation or '-', d.get('end_reason'), d.get('decisions'), d.get('seconds'), d.get('median_latency_ms')))
-print('  moves %s, blocked %s, 1 m/45 deg cap would trigger %sx' % (d.get('moves'), d.get('blocked_moves'), d.get('cap_would_trigger')))
-print('  log: ~/m20_sim/vlmnav/%s/  (steps.jsonl, summary.json, step_NNN.jpg)' % d.get('log'))
+if 'frontier_goals' in d:                     # search: the detail is the search summary
+    print('%s: %s (%s; %s ticks, %s frontier goals, %s views scored, %.1f m, %s s)' % (
+        r.status, r.interpretation or '-', d.get('end_reason'), d.get('decisions'), d.get('frontier_goals'),
+        d.get('scores'), d.get('path_m') or 0.0, d.get('seconds')))
+    print('  objects confirmed by the detector: %s' % d.get('objects_seen'))
+    print('  log: ~/m20_sim/vlfm/%s/  (steps.jsonl, summary.json, map_NNN.png, objects_seen.json)' % d.get('log'))
+else:
+    print('%s: last move %s (%s; %s decisions, %s s, median decision %s ms)' % (
+        r.status, r.interpretation or '-', d.get('end_reason'), d.get('decisions'), d.get('seconds'), d.get('median_latency_ms')))
+    print('  moves %s, blocked %s, 1 m/45 deg cap would trigger %sx' % (d.get('moves'), d.get('blocked_moves'), d.get('cap_would_trigger')))
+    print('  log: ~/m20_sim/vlmnav/%s/  (steps.jsonl, summary.json, step_NNN.jpg)' % d.get('log'))
 sys.exit(0 if r.success else 2)
 PYEOF"
     ;;

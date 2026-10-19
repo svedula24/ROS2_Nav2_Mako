@@ -6,7 +6,7 @@
 # zombie bt_navigator answered a goal with SUCCEEDED while the robot sat parked).
 # SIGINT first so DDS participants unregister from the discovery server cleanly.
 C=docker-commander-1
-PAT="navigation_launch|nav2_smoother|nav2_planner|nav2_behaviors|nav2_bt_navigator|nav2_waypoint|nav2_velocity|nav2_lifecycle|nav2_controller|component_container|slam_toolbox|bridge_node|nav_logger|pointcloud_to_laserscan|static_transform_publisher|estimator.py|m20_behaviors|foxglove_bridge|rosbridge_websocket|station_bridge|mission_server|m20_nlnav|nav2_map_server|lifecycle_manager_map|nav2_amcl|lifecycle_manager_localization|nav2_collision_monitor|lifecycle_manager_collision|m20_vlmnav"
+PAT="navigation_launch|nav2_smoother|nav2_planner|nav2_behaviors|nav2_bt_navigator|nav2_waypoint|nav2_velocity|nav2_lifecycle|nav2_controller|component_container|slam_toolbox|bridge_node|nav_logger|pointcloud_to_laserscan|static_transform_publisher|estimator.py|m20_behaviors|foxglove_bridge|rosbridge_websocket|station_bridge|mission_server|m20_nlnav|nav2_map_server|lifecycle_manager_map|nav2_amcl|lifecycle_manager_localization|nav2_collision_monitor|lifecycle_manager_collision|m20_vlmnav|m20_vlfm_search"
 docker exec $C bash -c "
   PIDS=\$(ps -eo pid,args | grep -E '$PAT' | grep -v grep | awk '{print \$1}')
   [ -n \"\$PIDS\" ] && kill -2 \$PIDS 2>/dev/null
@@ -18,5 +18,5 @@ docker exec $C bash -c "
     sleep 2
   done
   echo \"remaining stack procs: \$(ps -eo args | grep -E '$PAT' | grep -v grep | wc -l)\""
-docker rm -f m20_sim_run m20_splat_cam m20_splat_view m20_mujoco_mirror m20_detector m20_godot_bridge m20_nlnav m20_semmap_rec m20_vlm m20_vlmnav 2>/dev/null
+docker rm -f m20_sim_run m20_splat_cam m20_splat_view m20_mujoco_mirror m20_detector m20_godot_bridge m20_nlnav m20_semmap_rec m20_vlm m20_vlmnav m20_itm m20_vlfm 2>/dev/null
 echo "sim container removed; stack down."

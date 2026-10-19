@@ -2,6 +2,7 @@
 # NL-navigation eval on the live Godot stack (tools/godot/godot_sim_up.sh must be up).
 #   bash tools/nlnav_eval/eval.sh [--tag NAME] [--repeat N] [--model qwen2.5:3b-instruct] [--drive] [--only a,b]
 #                                 [--action /m20/vlmnav/navigate --cases tools/realtime_b/cases.yaml]
+#                                 [--action /m20/vlfm/navigate --cases tools/realtime_b/cases_search.yaml]
 # --model restarts the NL container on that Ollama model (tools/godot/nlnav_up.sh) and waits for its warm-up.
 # --drive runs the drive-level cases (moves the robot; ~1 min per case) instead of the plan-level ones.
 # --action / --cases: Real-time B (tools/realtime_b/realtime_b_up.sh up): the same harness drives the VLM episodes.
@@ -52,15 +53,21 @@ fi
 # configuration block: what this run was measured with
 # the model under test, chosen by the action: the offline NL node (m20_nlnav) or Real-time B's VLM server (m20_vlm).
 # It must be RUNNING (docker inspect also answers for a stopped leftover container, which would mislabel the run).
-case "$ACTION" in */vlmnav/*) MODEL_CTR=m20_vlm ;; *) MODEL_CTR=m20_nlnav ;; esac
-[ "$(docker inspect -f '{{.State.Running}}' "$MODEL_CTR" 2>/dev/null)" = "true" ] \
-  || { echo "ERROR: $MODEL_CTR is not running (needed for --action $ACTION)"; exit 1; }
-CFG=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MODEL_CTR" | python3 -c "
+# The search needs its matcher, its detector and its node: a missing one would read as a real not_found.
+case "$ACTION" in */vlmnav/*) MODEL_CTR=m20_vlm; NEED="m20_vlm" ;; */vlfm/*) MODEL_CTR=m20_itm; NEED="m20_itm m20_detector m20_vlfm" ;;
+                  *) MODEL_CTR=m20_nlnav; NEED="m20_nlnav" ;; esac
+for ctr in $NEED; do
+  [ "$(docker inspect -f '{{.State.Running}}' "$ctr" 2>/dev/null)" = "true" ] \
+    || { echo "ERROR: $ctr is not running (needed for --action $ACTION)"; exit 1; }
+done
+CFG=$(for ctr in $NEED; do docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$ctr"; done | python3 -c "
 import sys, json, os, subprocess
 env = dict(l.split('=', 1) for l in sys.stdin.read().split() if '=' in l)
-vlm = env.get('COSMOS_MODEL')
-cfg = {'llm': env.get('NLNAV_LLM') or ('vlm' if vlm else None), 'model': env.get('NLNAV_LLM_MODEL') or vlm,
+vlm = env.get('COSMOS_MODEL'); itm = env.get('ITM_MODEL')     # Real-time B: the VLM server, or the search's matcher
+cfg = {'llm': env.get('NLNAV_LLM') or ('vlm' if vlm else 'vlfm_search' if itm else None),
+       'model': env.get('NLNAV_LLM_MODEL') or vlm or itm,
        'encoder': 'owl' if not vlm else None,
+       'det_pose_topic': env.get('DET_POSE_TOPIC'), 'explore_map': env.get('M20_EXPLORE_MAP'),
        'localization': '$LOCMODE', 'odom': '$ODOM', 'action': '$ACTION',
        'object_map_bytes': os.path.getsize('$OBJECT_MAP') if os.path.exists('$OBJECT_MAP') else 0,
        'git': subprocess.run(['git', '-C', '$REPO', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()}
