@@ -1,0 +1,22 @@
+# The stage-1 OBJECT cases (tools/realtime_b/cases.yaml), judged exactly as there (same ids, 2.5 m, facing 45 deg),
+# run on the step-2 search: the apples-to-apples comparison of the two Real-time B designs. The text is the noun the
+# search takes; stage 1 saw the full sentence. Route instructions have no target to search for and stay stage-1 only.
+#   bash tools/nlnav_eval/eval.sh --drive --action /m20/vlfm/navigate --cases tools/realtime_b/cases_search_shared.yaml --tag vlfm_shared
+site: circuit4
+start_pose: [-2.13, 0.35, -1.6]        # the spawn, facing south down the main corridor
+cases:
+  - name: rtb_ladder_visible                  # ~11 m straight ahead down the corridor, in view from the spawn
+    drive: true
+    text: "ladder"
+    expect: {status: done, near_id: [28, 44], near_m: 2.5, facing_deg: 45}
+  - name: rtb_trash_can                       # #1 is 4 m away, off to the right behind the first desk
+    drive: true
+    text: "trash can"
+    expect: {status: done, near_id: [1, 126, 228, 236], near_m: 2.5, facing_deg: 45}
+  - name: rtb_fridge                          # #71 / #6 at the west side, 5 m away
+    drive: true
+    text: "refrigerator"
+    expect: {status: done, near_id: [71, 6, 75, 83], near_m: 2.5, facing_deg: 45}
+    known_issue: "stage 1's list names the west/south-east fridges only; the search's value map leads it north and it
+      finds the real fridge there (#239/#223, detector-confirmed, 13.3 m from the listed ids) - a case-list mismatch,
+      kept verbatim so the two designs are judged on identical text"

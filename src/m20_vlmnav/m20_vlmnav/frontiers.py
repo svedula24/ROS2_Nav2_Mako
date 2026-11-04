@@ -164,15 +164,17 @@ class Selector:
         return (int(robot_xy[0] // self.spot_m), int(robot_xy[1] // self.spot_m),
                 int(f_xy[0] // self.frontier_bin_m), int(f_xy[1] // self.frontier_bin_m))
 
-    def choose(self, frontiers: Sequence[Frontier], robot_xy: Tuple[float, float]) -> Optional[int]:
-        """Index of the frontier to go to, or None if there are none. Frontiers must carry their `value`."""
+    def choose(self, frontiers: Sequence[Frontier], robot_xy: Tuple[float, float], commit: bool = True) -> Optional[int]:
+        """Index of the frontier to go to, or None if there are none. Frontiers must carry their `value`.
+        commit=False only looks (no tries counted, hysteresis state untouched): call commit() when it is sent."""
         if not frontiers:
             return None
         order = sorted(range(len(frontiers)), key=lambda i: frontiers[i].value, reverse=True)
         usable = [i for i in order if self._ok(frontiers[i])]
         if not usable:                                      # every frontier failed once: VLFM's fallback, the farthest
             chosen = max(range(len(frontiers)), key=lambda i: math.dist(frontiers[i].xy, robot_xy))
-            self.last_xy, self.last_value = frontiers[chosen].xy, frontiers[chosen].value
+            if commit:
+                self.last_xy, self.last_value = frontiers[chosen].xy, frontiers[chosen].value
             return chosen
         order = usable
         chosen = None
@@ -189,9 +191,17 @@ class Selector:
                     break
         if chosen is None:                                  # all cyclic: VLFM's code takes the farthest
             chosen = max(order, key=lambda i: math.dist(frontiers[i].xy, robot_xy))
+        if commit:
+            self.commit(frontiers, chosen, robot_xy)
+        return chosen
+
+    def commit(self, frontiers: Sequence[Frontier], chosen: int, robot_xy: Tuple[float, float]):
+        """Record that `chosen` is now the goal: a try for this (spot, frontier) pair when it is a new one, and the
+        value the hysteresis compares against next tick. choose(commit=False) is a side-effect-free peek, for a
+        node that may decline the switch (a goal it just sent is kept for a while): a declined pick must not count
+        as a try, or two declines would mark the better frontier "cyclic" before it was ever driven to."""
         f = frontiers[chosen]
         k = self._key(robot_xy, f.xy)
         if self.last_xy is None or math.dist(f.xy, self.last_xy) > STICK_RADIUS_M:
             self.tries[k] = self.tries.get(k, 0) + 1
         self.last_xy, self.last_value = f.xy, f.value
-        return chosen

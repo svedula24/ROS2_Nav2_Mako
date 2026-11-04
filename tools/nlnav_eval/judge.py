@@ -2,7 +2,10 @@
 ROS container and by the unit tests). An attempt is a plain dict:
   {"status": str, "items": [{"label": str, "id": int, "x": float, "y": float}], ...}
 and for drive cases also {"final_xy": [x, y], "max_tilt_rad": float, "max_footprint_age_s": float,
-  "stop_drift_m": float}. Returns (passed, why)."""
+  "stop_drift_m": float}. Returns (passed, why).
+near_id as a list (2026-10-19): the attempt passes if ANY listed id meets near_m (and facing_deg); the reference used
+to be the NEAREST listed id, which failed a search that had approached another listed object. A single id is judged
+exactly as before."""
 import math
 
 
@@ -71,12 +74,24 @@ def _judge(expect, attempt, objects, localization):
             why.append(f"at approach pose ({da:.2f} m)")
         if "near_xy" in expect:
             tx, ty = expect["near_xy"]
-        elif "near_id" in expect:                               # one id, or a list = any of them (the nearest counts)
+        elif "near_id" in expect:
+            # one id, or a list = any of them is right. Judge against the listed one the robot actually ended at:
+            # the first that meets near_m (and facing_deg when asked); if none does, the nearest, so the report
+            # says how far off it was. (Before 2026-10-19 the NEAREST listed id was always the reference, so a
+            # search that approached listed fridge #223 was measured against #216 behind it and failed "facing".)
             ids = expect["near_id"] if isinstance(expect["near_id"], (list, tuple)) else [expect["near_id"]]
             known = [objects[i] for i in ids if objects and i in objects]
             if not known:
                 return False, f"object {expect['near_id']} position unknown"
-            tx, ty = min(known, key=lambda o: math.hypot(fx - o[0], fy - o[1]))
+            yaw0 = attempt.get("final_yaw")
+            def _ok(o):
+                if math.hypot(fx - o[0], fy - o[1]) > expect["near_m"]:
+                    return False
+                if "facing_deg" in expect and yaw0 is not None:
+                    return math.degrees(abs(math.remainder(math.atan2(o[1] - fy, o[0] - fx) - yaw0, 2 * math.pi))) <= expect["facing_deg"]
+                return True
+            good = [o for o in known if _ok(o)]
+            tx, ty = good[0] if good else min(known, key=lambda o: math.hypot(fx - o[0], fy - o[1]))
         elif items:
             tx, ty = items[-1]["x"], items[-1]["y"]
         else:

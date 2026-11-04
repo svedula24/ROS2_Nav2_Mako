@@ -68,6 +68,7 @@ cfg = {'llm': env.get('NLNAV_LLM') or ('vlm' if vlm else 'vlfm_search' if itm el
        'model': env.get('NLNAV_LLM_MODEL') or vlm or itm,
        'encoder': 'owl' if not vlm else None,
        'det_pose_topic': env.get('DET_POSE_TOPIC'), 'explore_map': env.get('M20_EXPLORE_MAP'),
+       'obstacle_scale': env.get('M20_OBSTACLE_SCALE'), 'min_vel_x': env.get('M20_MIN_VEL_X'), 'cam_min_z': env.get('M20_CAM_MIN_Z'),
        'localization': '$LOCMODE', 'odom': '$ODOM', 'action': '$ACTION',
        'object_map_bytes': os.path.getsize('$OBJECT_MAP') if os.path.exists('$OBJECT_MAP') else 0,
        'git': subprocess.run(['git', '-C', '$REPO', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()}

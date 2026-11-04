@@ -85,7 +85,15 @@ EXPLORE="${RTB_EXPLORE_MAP:-$EXPLORE}"
 M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=1 M20_LOC=odom M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
 M20_SITE_MAP="" M20_MAX_VEL="${GODOT_VMAX:-0.5}" M20_BEHAVIORS_EXTRA=drive_on_heading M20_COLLISION_MONITOR=1 \
 M20_EXPLORE_MAP="$EXPLORE" M20_EXPLORE_ORIGIN="${RTB_EXPLORE_ORIGIN:--8.5 -11.8}" M20_EXPLORE_SIZE="${RTB_EXPLORE_SIZE:-19 29}" \
+M20_OBSTACLE_SCALE="${RTB_OBSTACLE_SCALE:-1.0}" M20_MIN_VEL_X="${RTB_MIN_VEL_X:-0}" M20_CAM_MIN_Z="${RTB_CAM_MIN_Z:--0.30}" \
 bash "$REPO/tools/nav/bringup_plan_a.sh"
+# ^ keep-away defaults for Real-time B since 2026-10-19 (the offline launcher keeps the stock values): the controller
+# used to creep to within 7 cm of low obstacles (a 0.3 m floor pipe) and then no trajectory or recovery was valid ("No
+# valid trajectories out of 231"); a 1.0 footprint-critic weight and a floor cutoff 13 cm above the carpet ended that
+# (5 search cases: 4/5, zero "No valid trajectories"). Reversing (RTB_MIN_VEL_X=-0.15) was tried the same day and is
+# OFF: it freed the reproduction too, but the searches then wandered (ladder 37 m instead of 12, the cone 85 m and not
+# found, "No valid trajectories" back in bursts), and a low obstacle BEHIND the robot is seen by nothing (the depth
+# camera looks forward; the lidars look up).
 arm() { docker exec docker-commander-1 bash -lc "$SRC; timeout 10 ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: realtime_b_up}'" | grep -c "accepted=True" || true; }
 if [ "$(arm 2)" = "0" ]; then arm 0 >/dev/null; [ "$(arm 2)" = "1" ] || { echo "ERROR: the commander refused ASSISTED (tools/dev/m20 status)"; exit 1; }; fi
 echo "[realtime_b] armed ASSISTED"
@@ -109,6 +117,7 @@ elif [ "$MODE" = "search" ]; then
   docker rm -f m20_vlfm >/dev/null 2>&1 || true
   docker run -d --name m20_vlfm --network host --ipc host \
     -e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUNBUFFERED=1 -e M20_EXPLORE_MAP="$EXPLORE" \
+    -e M20_OBSTACLE_SCALE="${RTB_OBSTACLE_SCALE:-1.0}" -e M20_MIN_VEL_X="${RTB_MIN_VEL_X:-0}" -e M20_CAM_MIN_Z="${RTB_CAM_MIN_Z:--0.30}" \
     -v "$REPO/src/m20_vlmnav":/vlmnav:ro -v "$REPO/src/m20_nlnav":/nlnav:ro -v "$HOME/m20_sim/vlfm":/logs \
     m20_splat:latest bash -lc "source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export PYTHONPATH=/vlmnav:/nlnav:\$PYTHONPATH; \
 python3 -c 'from m20_vlmnav.search_node import main; main()' --ros-args -p log_dir:=/logs" >/dev/null

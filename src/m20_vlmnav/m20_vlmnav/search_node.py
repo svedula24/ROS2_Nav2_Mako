@@ -11,7 +11,9 @@ Inputs:  /camera/image_raw (rgb8), /camera/depth (32FC1 m), /odom (the believed 
          /m20/mode, /detections/objects (JSON), /global_costmap/get_costmap (service)
 Params:  itm_url (http://127.0.0.1:8091), log_dir, max_seconds (300), score_hz (2), plan_hz (1), fov_deg (90),
          fresh (True: clear the exploration + object maps first), look_around (True: VLFM's initial full turn),
-         empty_ticks (5: not_found only after this many frontier-less ticks in a row)
+         empty_ticks (5: not_found only after this many frontier-less ticks in a row), stuck_s / stuck_m (30 s / 1.0 m:
+         no progress = the robot stayed within stuck_m of its whole last stuck_s; the goal is given up, 3 such = "stuck"),
+         commit_s (10: a goal is kept at least this long before a better-valued frontier may replace it)
 Outputs: /detections/query (the target phrase), RunMission goals, per episode <log_dir>/<stamp>/{steps.jsonl,
          summary.json, map_NNN.png, objects_seen.json}
 """
@@ -44,13 +46,18 @@ from std_msgs.msg import Empty, String
 from m20_nlnav.approach import approach_pose
 from m20_nlnav.world import grid_from_costmap
 
+from . import behaviors
 from . import frontiers as fr
+from . import progress
 from .episode import terminal_action
-from .targets import same_class
+from .instruction import MOVES, OBJECT, classify
+from .targets import phrase_from, same_class
 from .value_map import PROMPT, ValueMap, depth_row_from_image
 
 STATUS = {"done": "done", "not_found": "not_found", "timeout": "error", "canceled": "canceled", "mode": "vetoed",
-          "crash": "error", "no_map": "error", "itm_error": "error"}
+          "crash": "error", "no_map": "error", "itm_error": "error", "stuck": "error",
+          "not_understood": "not_understood", "blocked": "error", "move_error": "error"}
+MAX_STUCK = 3                       # give up the episode after this many goals abandoned for no progress
 ITM_MAX_FAILURES = 5
 
 
@@ -81,13 +88,29 @@ class SearchNode(Node):
         for name, default in (("itm_url", "http://127.0.0.1:8091"), ("log_dir", os.path.expanduser("~/m20_sim/vlfm")),
                               ("max_seconds", 300.0), ("score_hz", 2.0), ("plan_hz", 1.0), ("fov_deg", 90.0),
                               ("max_depth", 5.0), ("min_depth", 0.5), ("fusion", "max_confidence"), ("fresh", True),
-                              ("look_around", True), ("empty_ticks", 5)):
+                              ("look_around", True), ("empty_ticks", 5), ("stuck_s", 30.0), ("stuck_m", 1.0),
+                              ("commit_s", 10.0), ("target_min_n", 5), ("target_min_score", 0.45),
+                              ("move_speed", 0.3)):
             self.declare_parameter(name, default)
         p = lambda n: self.get_parameter(n).value
         self.itm_url, self.log_dir, self.max_seconds = p("itm_url"), p("log_dir"), float(p("max_seconds"))
         self.fresh = bool(p("fresh"))          # every search starts from nothing: exploration map + object map cleared
         self.look_around = bool(p("look_around"))   # VLFM's initial full turn: every nearby frontier gets a value first
         self.empty_ticks = int(p("empty_ticks"))    # not_found only after this many ticks in a row without a frontier
+        # A robot that stayed within stuck_m of everywhere it was during the last stuck_s has made no progress: the
+        # goal is given up and blacklisted, and after MAX_STUCK such goals the episode ends "stuck". Nav2 keeps a
+        # boxed-in robot "running" through recoveries ("No valid trajectories", follow_path aborting, back-ups and
+        # spins that move it 0.3-0.5 m) until the episode clock runs out otherwise (two 300 s timeouts, 2026-10-19).
+        self.stuck_s, self.stuck_m = float(p("stuck_s")), float(p("stuck_m"))
+        # a goal is kept at least commit_s before a better-valued frontier may replace it (a retarget of the same
+        # frontier is always allowed): our scorer is noisier than VLFM's setting, and while Nav2 spins through
+        # recoveries the values near the goal repaint, the 0.01 hysteresis lets go and the search thrashed
+        # (54 switches in 180 s standing still)
+        self.commit_s = float(p("commit_s"))
+        # the detector confirms an object at 3 sightings; the SEARCH ends only on a firmer one (a filing cabinet was
+        # "whiteboard" at 0.58 after 3 sightings; real targets reach n 20-30 and 0.7-0.9 within seconds)
+        self.target_min_n, self.target_min_score = int(p("target_min_n")), float(p("target_min_score"))
+        self.move_speed = float(p("move_speed"))    # m/s for a dispatched forward move (stage 1's executor speed)
         self.score_dt, self.plan_dt = 1.0 / float(p("score_hz")), 1.0 / float(p("plan_hz"))
         self.fov, self.max_depth, self.min_depth, self.fusion = math.radians(float(p("fov_deg"))), float(p("max_depth")), float(p("min_depth")), p("fusion")
 
@@ -117,7 +140,9 @@ class SearchNode(Node):
         self.clear_costmap = self.create_client(ClearEntireCostmap, "/global_costmap/clear_entirely_global_costmap",
                                                 callback_group=self.cb)
         self.mission = ActionClient(self, RunMission, "/m20/mission/run", callback_group=self.cb)
-        self.spin = ActionClient(self, Spin, "/spin", callback_group=self.cb)
+        self.behaviors = behaviors.make_clients(self, self.cb)    # the executor shared with the VLM node
+        self.spin = self.behaviors["turn"]
+        self.active_move = None                # behavior goal handle of a dispatched move in flight
         self.spinning = None                   # (goal handle, result future) of the initial turn while it runs
         self.server = ActionServer(self, NavigateNL, "/m20/vlfm/navigate", execute_callback=self.execute,
                                    goal_callback=self.on_goal, cancel_callback=lambda _g: CancelResponse.ACCEPT,
@@ -241,26 +266,35 @@ class SearchNode(Node):
     # ---------- the search ----------
     def execute(self, gh):
         req, res = gh.request, NavigateNL.Result()
-        target = req.text.strip().lower()
+        # the front door: a move sequence is executed by dead reckoning, an object phrase is searched for, anything
+        # else is refused at once (a search for a sentence that names no object wandered 104 m)
+        instr = classify(req.text)
+        target = instr.phrase if instr.kind == OBJECT else " ".join(req.text.lower().split())
         stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
         out = os.path.join(self.log_dir, stamp)
-        log = {"target": target, "end": None, "t0": time.monotonic(), "steps": [], "frontier_goals": 0, "scores": 0,
-               "approach": None, "path_m": 0.0, "last_xy": None}
-        self.get_logger().info(f"search: {target!r} -> {out}")
+        log = {"target": target, "kind": instr.kind, "end": None, "t0": time.monotonic(), "steps": [], "frontier_goals": 0,
+               "scores": 0, "approach": None, "path_m": 0.0, "last_xy": None, "moves": [m.text() for m in instr.seq]}
+        self.get_logger().info(f"{instr.kind}: {target!r} -> {out}")
         try:                                                   # everything that can raise: `running` must clear
             os.makedirs(out, exist_ok=True)
-            self._run(gh, req, target, log, out)
+            if instr.kind == MOVES:
+                self._run_moves(gh, req, instr.seq, log)
+            elif instr.kind == OBJECT:
+                self._run(gh, req, target, log, out)
+            else:
+                log["end"] = "not_understood"
         except Exception as e:
             self.get_logger().error(f"search crashed: {type(e).__name__}: {e}")
             log["end"] = log["end"] or "crash"
         finally:
-            self.cancel_spin(); self.cancel_goto()
+            self.cancel_spin(); self.cancel_goto(); self.cancel_behavior()
             with self.goal_lock:
                 self.running = False
         status = STATUS.get(log["end"], "error")
         with self.lock:
             objs = self.detections.get("objects", [])
-        summary = {"target": target, "status": status, "end_reason": log["end"], "seconds": round(time.monotonic() - log["t0"], 1),
+        summary = {"target": target, "kind": log["kind"], "moves": log["moves"], "status": status, "end_reason": log["end"],
+                   "seconds": round(time.monotonic() - log["t0"], 1),
                    "decisions": len(log["steps"]), "frontier_goals": log["frontier_goals"], "scores": log["scores"],
                    "path_m": round(log["path_m"], 2), "approach": log["approach"], "objects_seen": len(objs)}
         try:                                                   # a logging failure must not leave the goal non-terminal
@@ -298,6 +332,53 @@ class SearchNode(Node):
         with self.lock:
             self.detections = {"frame": [], "objects": []}
         time.sleep(1.5)
+
+    # ---------- dead-reckoned moves (the dispatcher's MOVES branch; the same behaviors stage 1 drives) ----------
+    def _run_moves(self, gh, req, mvs, log):
+        """Execute the moves one after the other with behaviors.execute_move (stage 1's executor). A move the
+        behavior aborts (an obstacle) ends the episode "blocked"; the server missing or refusing -> "move_error"."""
+        if not req.dry_run and not self.mode_ok:
+            log["end"] = "mode"; return
+
+        def should_stop():
+            if gh.is_cancel_requested:
+                return "canceled"
+            if not self.mode_ok:
+                return "mode"
+            return None
+
+        def on_active(bgh):
+            self.active_move = bgh
+        for i, mv in enumerate(mvs):
+            step = {"t": round(time.monotonic() - log["t0"], 1), "i": i, "move": mv.text()}
+            with self.lock:
+                step["true_pose"] = self.true_pose
+            if req.dry_run:
+                step["result"] = "dry_run"; log["steps"].append(step); continue
+            ok, detail = behaviors.execute_move(self, self.behaviors, mv, self.move_speed, should_stop, on_active)
+            step["result"] = detail
+            with self.lock:
+                step["true_pose_after"] = self.true_pose
+            log["steps"].append(step)
+            self.get_logger().info(f"  move {i + 1}/{len(mvs)} {mv.text()}: {detail}")
+            if not ok:
+                if detail in ("canceled", "mode"):
+                    log["end"] = detail
+                elif detail.startswith("behavior status"):
+                    log["end"] = "blocked"
+                else:
+                    log["end"] = "move_error"
+                return
+        log["end"] = "done"
+
+    def cancel_behavior(self):
+        """A crash path's cleanup: a dispatched move still in flight is cancelled (fire-and-forget)."""
+        if self.active_move is not None:
+            try:
+                self.active_move.cancel_goal_async()
+            except Exception:
+                pass
+            self.active_move = None
 
     def start_spin(self, yaw=2 * math.pi, allow_s=25.0):
         """Start a full turn on the spot (Nav2 Spin behavior) and return at once; the loop keeps scoring views."""
@@ -345,6 +426,7 @@ class SearchNode(Node):
         goal_xy, goal_frontier_value = None, None
         next_score, next_plan, next_png, n_png = 0.0, 0.0, 0.0, 0
         empty = 0                                              # ticks in a row without a frontier
+        trail, stuck_n, goal_t = [], 0, 0.0                    # (time, xy) over the last stuck_s; goals abandoned; last send
         itm_failures = 0                                       # scores in a row the matcher did not answer
         q = String(); q.data = target
         self.query_pub.publish(q)
@@ -382,10 +464,12 @@ class SearchNode(Node):
             next_plan = now + self.plan_dt
             step = {"t": round(now - log["t0"], 1), "pose": [round(v, 3) for v in pose], "true_pose": tp,
                     "score": round(log.get("last_score", -1.0), 4)}
-            found = [o for o in dets.get("objects", []) if same_class(str(o.get("cls", "")), target)]
+            found = [o for o in dets.get("objects", []) if same_class(str(o.get("cls", "")), target)
+                     and o.get("n", 0) >= self.target_min_n and o.get("score", 0) >= self.target_min_score]
             if found:
                 o = max(found, key=lambda o: o.get("score", 0))
-                step["detected"] = {"xy": o["xyz"][:2], "n": o.get("n"), "score": o.get("score")}
+                step["detected"] = {"xy": o["xyz"][:2], "n": o.get("n"), "score": o.get("score"),
+                                    "itm": round(log.get("last_score", -1.0), 4)}      # the view's cosine, for calibration
                 if req.dry_run:
                     log["steps"].append(step); log["end"] = "done"; return
                 self.cancel_spin(); self.cancel_goto()
@@ -424,6 +508,19 @@ class SearchNode(Node):
             for f in fs:
                 f.value = vm.read(f.xy[0], f.xy[1])
             state = self.goto_state()
+            # progress watchdog (believed pose; drift is slow next to the window): stuck = the robot has stayed
+            # within stuck_m of every point of its last stuck_s, whatever goals were sent meanwhile
+            trail.append((now, pose[:2]))
+            trail = progress.prune(trail, now, self.stuck_s)
+            if goal_xy is not None and progress.is_stuck(trail, now, pose[:2], self.stuck_s, self.stuck_m):
+                stuck_n += 1
+                step["stuck"] = [round(goal_xy[0], 2), round(goal_xy[1], 2), stuck_n]
+                self.get_logger().warn(f"  no progress in {self.stuck_s:.0f} s (goal {goal_xy[0]:.2f}, {goal_xy[1]:.2f}): "
+                                       f"giving it up ({stuck_n}/{MAX_STUCK})")
+                self.cancel_goto(); sel.fail(goal_xy)
+                state, goal_xy, trail = "failed", None, []
+                if stuck_n >= MAX_STUCK:
+                    log["steps"].append(step); log["end"] = "stuck"; return
             step["frontiers"] = len(fs)
             step["top"] = [[round(f.xy[0], 2), round(f.xy[1], 2), round(f.value, 3)] for f in sorted(fs, key=lambda f: -f.value)[:3]]
             if not fs:
@@ -445,19 +542,28 @@ class SearchNode(Node):
                            key=lambda f: math.dist(f.xy, goal_xy), default=None)
                 if same is not None:
                     sel.track(same.xy)
-                    i = sel.choose(fs, pose[:2])
+                    i = sel.choose(fs, pose[:2], commit=False)         # a peek: nothing counted until it is sent
                     pick = fs[i]
                     if pick is not same and math.dist(pick.xy, same.xy) > fr.STICK_RADIUS_M:
-                        step["switch"] = [round(pick.xy[0], 2), round(pick.xy[1], 2), round(pick.value, 3)]
-                        goal_xy = self._go(pick, pose, log) or goal_xy
-                    elif math.dist(same.xy, goal_xy) > fr.STICK_RADIUS_M:
-                        step["retarget"] = [round(same.xy[0], 2), round(same.xy[1], 2)]
-                        goal_xy = self._go(same, pose, log) or goal_xy
+                        if progress.switch_allowed(now, goal_t, self.commit_s):   # the current goal had its chance
+                            step["switch"] = [round(pick.xy[0], 2), round(pick.xy[1], 2), round(pick.value, 3)]
+                            sent = self._go(pick, pose, log)
+                            if sent:
+                                sel.commit(fs, i, pose[:2]); goal_xy, goal_t = sent, now
+                        # declined: the selector still holds `same` at the last tick's value; judged again next tick
+                    else:
+                        # kept (or retargeted): commit so last_value becomes THIS tick's value, as VLFM's hysteresis
+                        # compares tick to tick; it counts no try, the pick being within STICK_RADIUS_M of last_xy
+                        sel.commit(fs, i, pose[:2])
+                        if math.dist(same.xy, goal_xy) > fr.STICK_RADIUS_M:      # a retarget is never gated
+                            step["retarget"] = [round(same.xy[0], 2), round(same.xy[1], 2)]
+                            goal_xy = self._go(same, pose, log) or goal_xy
                 else:                                          # the goal frontier is gone (consumed or merged away)
                     i = sel.choose(fs, pose[:2])
                     pick = fs[i]
                     step["switch"] = [round(pick.xy[0], 2), round(pick.xy[1], 2), round(pick.value, 3)]
-                    goal_xy = self._go(pick, pose, log) or goal_xy
+                    sent = self._go(pick, pose, log)
+                    goal_xy, goal_t = (sent, now) if sent else (goal_xy, goal_t)
                 step["goal"] = [round(goal_xy[0], 2), round(goal_xy[1], 2)]
             else:
                 if goal_xy is not None and state == "failed":
@@ -471,7 +577,7 @@ class SearchNode(Node):
                     sel.fail(goal_xy)
                 i = sel.choose(fs, pose[:2])
                 pick = fs[i]
-                goal_xy = self._go(pick, pose, log)
+                goal_xy, goal_t = self._go(pick, pose, log), now
                 if goal_xy is None:                            # the mission server did not take it: try again next tick
                     step["goal_rejected"] = [round(pick.xy[0], 2), round(pick.xy[1], 2)]
                 else:

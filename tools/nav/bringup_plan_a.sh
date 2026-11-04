@@ -427,6 +427,33 @@ else
 fi
 sleep 6
 
+# Keep-away / escape knobs (unset = unchanged), for the boxed-in investigation (2026-10-19: the controller grazed a
+# 0.3 m floor pipe to within 7 cm, every trajectory and the spin/back-up recoveries then collided; nav2.log "No valid
+# trajectories out of 231"):  M20_OBSTACLE_SCALE  ObstacleFootprint critic weight (0.15 staged; higher = keep away)
+#   M20_MIN_VEL_X  DWB min_vel_x (0 staged; negative lets the controller reverse out of a corner)
+#   M20_CAM_MIN_Z  camera_layer min_obstacle_height (-0.36 staged; the floor sits at -0.43: -0.30 marks less floor noise)
+# M20_OBSTACLE_SCALE only matters on the external-sim path (ObstacleFootprint); the MuJoCo path still scores
+# BaseObstacle, where the key is written but unused. M20_CAM_MIN_Z needs the camera_layer (external sim) and fails
+# loudly without it.
+if [ -n "${M20_OBSTACLE_SCALE:-}${M20_MIN_VEL_X:-}${M20_CAM_MIN_Z:-}" ]; then
+  echo "[4.7/7] keep-away knobs: obstacle scale ${M20_OBSTACLE_SCALE:-unchanged}, min_vel_x ${M20_MIN_VEL_X:-unchanged}, camera min z ${M20_CAM_MIN_Z:-unchanged}"
+  docker exec -i -e OS="${M20_OBSTACLE_SCALE:-}" -e MV="${M20_MIN_VEL_X:-}" -e CZ="${M20_CAM_MIN_Z:-}" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+f = cfg["controller_server"]["ros__parameters"]["FollowPath"]
+if os.environ["OS"]:
+    f["ObstacleFootprint.scale"] = float(os.environ["OS"])
+if os.environ["MV"]:
+    f["min_vel_x"] = float(os.environ["MV"])
+if os.environ["CZ"]:
+    for k in ("global_costmap", "local_costmap"):
+        cfg[k][k]["ros__parameters"]["camera_layer"]["camera"]["min_obstacle_height"] = float(os.environ["CZ"])
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched:", {k: v for k, v in (("ObstacleFootprint.scale", os.environ["OS"]), ("min_vel_x", os.environ["MV"]), ("camera min z", os.environ["CZ"])) if v})
+PYEOF
+fi
+
 # Exploration-map hook (M20_EXPLORE_MAP=1; unset = unchanged): the global costmap becomes the robot's own memory of an
 # UNSEEN site, VLFM-style: non-rolling, fixed to the site's extent, starting all-unknown and filling in from the global
 # costmap's own layers (obstacle_layer on /scan, camera_layer on the depth cloud) as the robot moves (track_unknown_space).

@@ -36,19 +36,14 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
-from builtin_interfaces.msg import Duration
 from m20_msgs.action import NavigateNL
 from m20_msgs.msg import RobotMode
-from nav2_msgs.action import DriveOnHeading, Spin
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
 
-from . import history, moves
+from . import behaviors, history, moves
 from .episode import Episode, Limits, terminal_action
 
-SPIN_RATE = 0.5                 # rad/s assumed for the time allowance (the behavior's own max_rotational_vel is 0.7)
-MOVE_MARGIN_S = 5.0             # allowance = ideal duration x 2 + this; the wait for the result = allowance + this
-MAX_ALLOWANCE_S = 120.0         # keeps Duration.sec sane whatever the move (moves.py clamps first anyway)
 
 
 def yaw_of(q) -> float:
@@ -59,16 +54,6 @@ def jpeg_b64(rgb: np.ndarray, quality: int = 85) -> str:
     buf = io.BytesIO()
     PILImage.fromarray(rgb).save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode()
-
-
-def duration(s: float) -> Duration:
-    s = max(0.0, min(float(s), MAX_ALLOWANCE_S))
-    return Duration(sec=int(s), nanosec=int((s - int(s)) * 1e9))
-
-
-def allowance_s(move: moves.Move, speed: float) -> float:
-    ideal = move.amount / speed if move.kind == moves.FORWARD else abs(move.yaw()) / SPIN_RATE
-    return ideal * 2.0 + MOVE_MARGIN_S
 
 
 class VLMNavNode(Node):
@@ -98,10 +83,7 @@ class VLMNavNode(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(RobotMode, "/m20/mode", self.on_mode, latched, callback_group=self.cb)
-        self.behaviors = {
-            moves.FORWARD: ActionClient(self, DriveOnHeading, "/drive_on_heading", callback_group=self.cb),
-            "turn": ActionClient(self, Spin, "/spin", callback_group=self.cb),
-        }
+        self.behaviors = behaviors.make_clients(self, self.cb)    # the executor shared with the search node
         self.server = ActionServer(self, NavigateNL, "/m20/vlmnav/navigate", execute_callback=self.execute,
                                    goal_callback=self.on_goal, cancel_callback=lambda _gh: CancelResponse.ACCEPT,
                                    callback_group=self.cb)
@@ -149,53 +131,18 @@ class VLMNavNode(Node):
 
     # ---------- moves ----------
     def run_move(self, gh, move: moves.Move):
-        """Execute one move with a Nav2 behavior. -> (ok, detail). detail: ok | behavior status N (aborted) |
-        canceled | mode | timeout | behavior server ... unavailable | not acknowledged | rejected.
-        Bounded: waits at most the time allowance + margin, then cancels and reports "timeout"."""
-        allow = allowance_s(move, self.speed)
-        if move.kind == moves.FORWARD:
-            client = self.behaviors[moves.FORWARD]
-            goal = DriveOnHeading.Goal()
-            goal.target.x, goal.speed = float(move.amount), float(self.speed)
-        else:
-            client = self.behaviors["turn"]
-            goal = Spin.Goal()
-            goal.target_yaw = float(move.yaw())
-        goal.time_allowance = duration(allow)
-        if not client.wait_for_server(timeout_sec=5.0):
-            return False, f"behavior server for {move.kind} unavailable"
-        send = client.send_goal_async(goal)
-        if not self._wait(send, 5.0):
-            return False, "behavior goal not acknowledged"
-        bgh = send.result()
-        if bgh is None or not bgh.accepted:
-            return False, "behavior rejected the goal"
-        self.active = bgh
-        try:
-            res = bgh.get_result_async()
-            t0 = time.monotonic()
-            while not res.done():
-                if gh.is_cancel_requested or not self.mode_ok:
-                    why = "canceled" if gh.is_cancel_requested else "mode"
-                    self._cancel_behavior(bgh, res, why)
-                    return False, why
-                if time.monotonic() - t0 > allow + MOVE_MARGIN_S:
-                    self._cancel_behavior(bgh, res, "timeout")
-                    return False, "timeout: no result from the behavior server"
-                time.sleep(0.05)
-            status = res.result().status
-            return status == 4, "ok" if status == 4 else f"behavior status {status} (aborted: blocked or timed out)"
-        finally:
-            self.active = None
+        """Execute one move with a Nav2 behavior (behaviors.execute_move). -> (ok, detail); detail: ok | behavior
+        status N (aborted) | canceled | mode | timeout | behavior server ... unavailable | not acknowledged | rejected."""
+        def should_stop():
+            if gh.is_cancel_requested:
+                return "canceled"
+            if not self.mode_ok:
+                return "mode"
+            return None
 
-    def _cancel_behavior(self, bgh, res, why):
-        """Cancel the running behavior and wait (briefly) for it to acknowledge; the behavior server itself sends
-        the zero velocity when it stops. Logs whether it really stopped."""
-        cf = bgh.cancel_goal_async()
-        acked = self._wait(cf, 3.0) and bool(cf.result().goals_canceling)
-        ended = self._wait(res, 3.0)
-        self.get_logger().info(f"move {why}: cancel {'acknowledged' if acked else 'NOT acknowledged'}, "
-                               f"behavior {'ended' if ended else 'still running after 3 s'}")
+        def on_active(bgh):
+            self.active = bgh
+        return behaviors.execute_move(self, self.behaviors, move, self.speed, should_stop, on_active)
 
     @staticmethod
     def _wait(fut, timeout):

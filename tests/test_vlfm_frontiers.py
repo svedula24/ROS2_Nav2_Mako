@@ -128,3 +128,56 @@ def test_tracking_a_drifting_waypoint_keeps_the_hysteresis_against_the_last_tick
     dropped = [mk((5.6, 0.3), 0.25), mk((0.0, 8.0), 0.302)]   # 0.265 -> 0.25: more than 0.01 in one tick
     s.track(dropped[0].xy)
     assert s.choose(dropped, (0.0, 0.0)) == 1                 # VLFM lets go
+
+
+def test_a_peek_counts_no_try_so_two_declined_switches_do_not_poison_the_better_frontier():
+    s = Selector()
+    fs = [mk((5.0, 0.0), 0.20), mk((0.0, 8.0), 0.30)]
+    assert s.choose(fs, (0.0, 0.0)) == 1                     # sent: the better one, one try counted
+    s.fail(fs[1].xy)                                          # ...and lost; now driving to the other
+    assert s.choose(fs, (0.0, 0.0)) == 0
+    # the goal's value drops (hysteresis lets go) and a better frontier has appeared: the node peeks, and declines
+    # the switch while its goal is inside the commit time
+    later = [mk((5.0, 0.0), 0.15), mk((0.0, 8.0), 0.30), mk((6.0, 6.0), 0.40)]
+    for _ in range(3):
+        s.track(later[0].xy)
+        assert s.choose(later, (0.0, 0.0), commit=False) == 2
+    assert s.tries.get((0, 0, 6, 6), 0) == 0                  # never counted as tried
+    assert s.last_xy == (5.0, 0.0) and s.last_value == 0.20   # the hysteresis state is untouched by peeks
+    assert s.choose(later, (0.0, 0.0)) == 2                   # allowed at last: still the better one, not "cyclic"
+    assert s.tries.get((0, 0, 6, 6), 0) == 1
+
+
+def test_the_nodes_peek_then_commit_on_keep_still_compares_tick_to_tick():
+    """search_node's pattern: track the goal, peek, and commit when the pick is kept. A slow decline of 0.005 a tick
+    must never let go (VLFM compares with the LAST tick, not the value at the send)."""
+    s = Selector()
+    fs = [mk((5.0, 0.0), 0.30), mk((0.0, 8.0), 0.29)]
+    i = s.choose(fs, (0.0, 0.0), commit=False); assert i == 0
+    s.commit(fs, i, (0.0, 0.0))                               # sent
+    v = 0.30
+    for _ in range(8):                                        # 0.30 -> 0.26 over eight ticks
+        v -= 0.005
+        tick = [mk((5.0, 0.0), v), mk((0.0, 8.0), 0.29)]
+        s.track(tick[0].xy)
+        i = s.choose(tick, (0.0, 0.0), commit=False)
+        assert i == 0                                         # kept
+        s.commit(tick, i, (0.0, 0.0))                         # ...and committed, as the node does on a keep
+    assert s.tries.get((0, 0, 5, 0)) == 1                     # keeps count no tries
+    assert abs(s.last_value - 0.26) < 1e-9
+    s.fail(fs[0].xy); s.fail(fs[1].xy)
+    before = (s.last_xy, s.last_value)
+    s.choose(fs, (0.0, 0.0), commit=False)                    # the all-failed fallback is side-effect-free too
+    assert (s.last_xy, s.last_value) == before
+
+
+def test_phrase_from_pulls_the_object_out_of_an_instruction_and_leaves_routes_whole():
+    from m20_vlmnav.targets import phrase_from
+    assert phrase_from("go to the ladder") == "ladder"
+    assert phrase_from("find a trash can and stop in front of it") == "trash can"
+    assert phrase_from("Go to the refrigerator.") == "refrigerator"
+    assert phrase_from("refrigerator") == "refrigerator"
+    assert phrase_from("turn left 90 degrees") == "turn left 90 degrees"
+    assert phrase_from("move forward 2 meters, then stop") == "move forward 2 meters"
+    assert phrase_from("go straight down the corridor and stop next to the first desk on your left") == \
+        "go straight down the corridor and stop next to the first desk on your left"
