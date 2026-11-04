@@ -235,3 +235,7 @@ tools/nav/out_demo/
 # tools/ci/out/*.csv (gate results), maps/ (the map artifact + its score).
 tools/nav/out_*/
 tools/ci/out/run_*/
+
+# never committed: working notes, editor workspace files
+notes/
+*.code-workspace
