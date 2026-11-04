@@ -494,9 +494,8 @@ class SearchNode(Node):
                     with self.lock:
                         p_now = self.pose
                     if p_now is not None:                      # a boxed-in approach is given up like a frontier is
-                        trail.append((t_now, p_now[:2]))
-                        trail = progress.prune(trail, t_now, self.stuck_s)
-                        if progress.is_stuck(trail, t_now, p_now[:2], self.stuck_s, self.stuck_m):
+                        trail, stuck = self._tick_trail(trail, t_now, p_now[:2])
+                        if stuck:
                             self.get_logger().warn(f"  no progress in {self.stuck_s:.0f} s on the approach: giving up")
                             self.cancel_goto(); log["approach"]["stuck"] = True
                             log["end"] = "stuck"; return
@@ -517,14 +516,14 @@ class SearchNode(Node):
                 f.value = vm.read(f.xy[0], f.xy[1])
             state = self.goto_state()
             # progress watchdog (believed pose; drift is slow next to the window): stuck = the robot has stayed
-            # within stuck_m of every point of its last stuck_s while one goal ran (a newly sent goal restarts the
-            # window; a reached goal is not "no progress" however short it was)
-            if log.pop("trail_reset", False):               # a goal was sent since the last tick: judge from there
+            # within stuck_m of every point of its last stuck_s, WHATEVER goals were sent meanwhile (a boxed-in
+            # robot keeps "running" through recoveries while better-valued frontiers are accepted every commit_s:
+            # a window that restarted on every send would never fill). Only a REACHED goal restarts it: short goals
+            # reached one after the other inside stuck_m are progress, not a box.
+            if state == "reached":
                 trail = []
-            trail.append((now, pose[:2]))
-            trail = progress.prune(trail, now, self.stuck_s)
-            if goal_xy is not None and state == "running" and \
-                    progress.is_stuck(trail, now, pose[:2], self.stuck_s, self.stuck_m):
+            trail, stuck = self._tick_trail(trail, now, pose[:2])
+            if goal_xy is not None and stuck:
                 stuck_n += 1
                 step["stuck"] = [round(goal_xy[0], 2), round(goal_xy[1], 2), stuck_n]
                 self.get_logger().warn(f"  no progress in {self.stuck_s:.0f} s (goal {goal_xy[0]:.2f}, {goal_xy[1]:.2f}): "
@@ -599,16 +598,20 @@ class SearchNode(Node):
                 next_png = now + 10.0
                 self._png(vm, cost, origin, res_m, fs, goal_xy, pose, os.path.join(out, f"map_{n_png:03d}.png")); n_png += 1
 
+    def _tick_trail(self, trail, now, xy):
+        """The progress watchdog's one step: add the believed xy, drop what is older than stuck_s, judge.
+        -> (trail, stuck). Stuck = the trail spans the window and never left stuck_m of where the robot is now."""
+        trail.append((now, xy))
+        trail = progress.prune(trail, now, self.stuck_s)
+        return trail, progress.is_stuck(trail, now, xy, self.stuck_s, self.stuck_m)
+
     def _go(self, f, pose, log):
-        """Send a frontier as the mission goal. -> its xy, or None if the mission server did not accept it.
-        A sent goal restarts the progress window (log["trail_reset"], consumed by the loop): a run of short goals,
-        each reached, is progress even when they all lie within stuck_m of each other."""
+        """Send a frontier as the mission goal. -> its xy, or None if the mission server did not accept it."""
         yaw = math.atan2(f.xy[1] - pose[1], f.xy[0] - pose[0])
         if self.send_goto(f"frontier {f.xy[0]:.1f},{f.xy[1]:.1f}", f.xy[0], f.xy[1], yaw) is None:
             self.get_logger().warn(f"  frontier goal ({f.xy[0]:.2f}, {f.xy[1]:.2f}) not accepted by the mission server")
             return None
         log["frontier_goals"] += 1
-        log["trail_reset"] = True
         self.get_logger().info(f"  frontier goal ({f.xy[0]:.2f}, {f.xy[1]:.2f}) value {f.value:.3f}, {f.length_m} m long")
         return f.xy
 

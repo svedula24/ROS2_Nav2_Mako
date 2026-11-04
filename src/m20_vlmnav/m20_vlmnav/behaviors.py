@@ -89,25 +89,29 @@ def execute_move(node, clients: dict, move: moves.Move, speed: float,
         return False, "behavior rejected the goal"
     on_active(bgh)
     res = bgh.get_result_async()
+    cancelling = False
     try:
         t0 = time.monotonic()
         while not res.done():
             why = should_stop()
             if why:
+                cancelling = True
                 cancel_behavior(node, bgh, res, why)
                 return False, why
             if time.monotonic() - t0 > allow + MOVE_MARGIN_S:
+                cancelling = True
                 cancel_behavior(node, bgh, res, "timeout")
                 return False, "timeout: no result from the behavior server"
             time.sleep(0.05)
         status = res.result().status
         return status == 4, "ok" if status == 4 else f"behavior status {status} (aborted: blocked or timed out)"
     except BaseException:
-        # an exception inside the wait (should_stop() crashing, a shutdown): the behavior is cancelled HERE, before
-        # the handle is forgotten in `finally`; the caller's crash path would otherwise find nothing to cancel
-        if not res.done():
+        # an exception inside the wait (should_stop() crashing, Ctrl-C): the behavior gets a fire-and-forget
+        # cancel HERE, before the handle is forgotten in `finally`; no waiting (the executor may be shutting down)
+        # and no second cancel when the exception came out of cancel_behavior itself
+        if not cancelling and not res.done():
             try:
-                cancel_behavior(node, bgh, res, "crash")
+                bgh.cancel_goal_async()
             except Exception:
                 pass
         raise

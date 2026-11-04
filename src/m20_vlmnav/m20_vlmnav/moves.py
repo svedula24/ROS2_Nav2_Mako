@@ -20,7 +20,7 @@ Two different bounds, deliberately apart:
 import math
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 FORWARD, TURN_LEFT, TURN_RIGHT, STOP = "forward", "turn_left", "turn_right", "stop"
 
@@ -65,8 +65,10 @@ def _clean(text: str) -> str:
     return m.group(1) if m else t
 
 
-def parse(text: str) -> Optional[Move]:
-    """The one move named in the reply, or None: no move, a zero amount, or several moves (ambiguous)."""
+def requested(text: str) -> Optional[Tuple[str, float]]:
+    """The one move named in the text, UNCLAMPED: (kind, metres | radians | 0 for stop), or None when there is no
+    move, a zero amount, or several moves (ambiguous). parse() applies the sanity clamp on top of this; the typed
+    instructions (instruction.py) read the number from here, so there is one regex for it."""
     if not text:
         return None
     t = _clean(text)
@@ -75,15 +77,26 @@ def parse(text: str) -> Optional[Move]:
         return None
     m, kind = found[0]
     if kind == "stop":
-        return Move(STOP)
+        return STOP, 0.0
     value = float(m.group(2))
     if value <= 0:
         return None
     if kind == "drive":
-        metres = value / 100.0 if m.group(3).startswith("c") else value
-        return Move(FORWARD, min(metres, MAX_DIST_M), metres > MAX_DIST_M)
-    rad = math.radians(value)
-    return Move(TURN_LEFT if m.group(1) == "left" else TURN_RIGHT, min(rad, MAX_TURN_RAD), rad > MAX_TURN_RAD)
+        return FORWARD, (value / 100.0 if m.group(3).startswith("c") else value)
+    return (TURN_LEFT if m.group(1) == "left" else TURN_RIGHT), math.radians(value)
+
+
+def parse(text: str) -> Optional[Move]:
+    """The one move named in the reply, or None: no move, a zero amount, or several moves (ambiguous)."""
+    r = requested(text)
+    if r is None:
+        return None
+    kind, amount = r
+    if kind == STOP:
+        return Move(STOP)
+    if kind == FORWARD:
+        return Move(FORWARD, min(amount, MAX_DIST_M), amount > MAX_DIST_M)
+    return Move(kind, min(amount, MAX_TURN_RAD), amount > MAX_TURN_RAD)
 
 
 def cap_would_trigger(move: Move) -> bool:

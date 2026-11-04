@@ -43,6 +43,14 @@ def test_reasoning_is_ignored_and_an_answer_block_wins():
     assert moves.parse("turn right 45º") == Move(TURN_RIGHT, math.radians(45))        # ordinal sign typed for degrees
 
 
+def test_requested_is_the_unclamped_amount_parse_clamps():
+    assert moves.requested("move forward 50 m") == (FORWARD, 50.0)
+    assert moves.requested("turn left 3600 degrees") == (TURN_LEFT, math.radians(3600))
+    assert moves.requested("stop") == (STOP, 0.0)
+    assert moves.requested("move forward 1 m and turn left 10 degrees") is None    # two moves: ambiguous
+    assert moves.parse("move forward 50 m") == Move(FORWARD, moves.MAX_DIST_M, True)
+
+
 def test_sanity_clamp_is_applied_and_flagged():
     big = moves.parse("move forward 50 m")
     assert big == Move(FORWARD, moves.MAX_DIST_M, True) and big.clamped

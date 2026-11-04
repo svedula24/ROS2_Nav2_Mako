@@ -27,6 +27,14 @@ def test_a_long_typed_distance_is_split_into_legs_not_shortened():
     assert kinds("walk 7 meters") == [(moves.FORWARD, 3.0), (moves.FORWARD, 3.0), (moves.FORWARD, 1.0)]
     assert kinds("move forward 5 m then stop") == [(moves.FORWARD, 3.0), (moves.FORWARD, 2.0)]
     assert classify("walk 500 meters").kind == UNKNOWN          # above MAX_TYPED_DIST_M: refused, not shortened
+    assert kinds("walk 3.0000001 m") == [(moves.FORWARD, 3.0)]   # a remainder under a cm is not a leg
+    assert kinds("in 2 m go forward 5 m") == [(moves.FORWARD, 3.0), (moves.FORWARD, 2.0)]   # the parser's number, not the first
+
+
+def test_a_long_typed_turn_is_split_like_a_distance():
+    assert kinds("turn right 360 degrees") == [(moves.TURN_RIGHT, round(math.pi, 3)), (moves.TURN_RIGHT, round(math.pi, 3))]
+    assert kinds("turn left 270 degrees") == [(moves.TURN_LEFT, round(math.pi, 3)), (moves.TURN_LEFT, round(math.pi / 2, 3))]
+    assert classify("turn left 900 degrees").kind == UNKNOWN     # above two full turns: refused
 
 
 def test_a_conditional_stop_refuses_the_whole_instruction():
@@ -40,8 +48,14 @@ def test_article_less_and_can_of_phrases_are_objects():
     assert classify("find ladder").phrase == "ladder"
     assert classify("go to refrigerator").phrase == "refrigerator"
     assert classify("can of soda").phrase == "can of soda"
-    assert classify("is there a ladder").kind == UNKNOWN
-    assert classify("can you find the ladder").kind == UNKNOWN
+    assert classify("go to the bus stop").phrase == "bus stop"   # "stop" inside a noun is not a motion word
+    assert classify("stop sign").phrase == "stop sign"
+
+
+def test_questions_are_refused_whatever_follows_the_verb():
+    for q in ("is there a ladder", "can you find the ladder", "is my mug on the desk", "can someone find the ladder",
+              "does anyone see a ladder", "are those chairs", "could the robot go left"):
+        assert classify(q).kind == UNKNOWN, q
 
 
 def test_routes_questions_and_backward_moves_are_unknown():

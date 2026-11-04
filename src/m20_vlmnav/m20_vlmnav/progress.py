@@ -1,10 +1,11 @@
 """The search's two timing rules, pure (no ROS), so they can be tested like episode.terminal_action:
 
     stuck            the robot has made no progress: over the last `window_s` it never got farther than `radius_m`
-                     from where it is now. Nav2 keeps a boxed-in robot "running" through recoveries (back-ups and
-                     spins of 0.3-0.5 m) for as long as the mission lasts, so a displacement test fails to see it.
-                     The node restarts the window whenever it sends a goal: short goals reached one after the other
-                     inside radius_m are progress, not a box.
+                     from where it is now, whatever goals were sent meanwhile. Nav2 keeps a boxed-in robot "running"
+                     through recoveries (back-ups and spins of 0.3-0.5 m) for as long as the mission lasts, so a
+                     displacement test fails to see it, and a window that restarted on every goal would never fill
+                     while better-valued frontiers keep being accepted. The node restarts the window only on a
+                     REACHED goal: short goals reached one after the other inside radius_m are progress, not a box.
     switch allowed   a goal just sent is kept at least `commit_s` before a better-valued frontier may replace it (the
                      scorer is noisier than VLFM's setting; values near the goal repaint while Nav2 spins); a RETARGET
                      (the same frontier's waypoint moved) is never gated.
