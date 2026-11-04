@@ -93,3 +93,24 @@ def test_judge_localization_heading_and_modes():
     assert not judge(e, lost, localization="gt")[0]
     ok, why = judge(e, lost, localization="odom")
     assert ok and "not judged" in why and "2.40" in why
+
+
+def test_judge_realtime_b_facing_and_heading():
+    """Real-time B: arrival near a target AND facing it; a pure turn judged on heading; near_id may list ids."""
+    objs = {28: (-2.12, -10.83), 44: (-1.62, -10.53)}
+    e = {"status": "done", "near_id": [28, 44], "near_m": 2.5, "facing_deg": 45}
+    base = {"status": "done", "items": [], "start_xy": [-2.13, 0.35], "path_len_m": 12.0}
+    import math
+    facing = dict(base, final_xy=[-2.1, -8.9], final_yaw=-math.pi / 2)        # 1.9 m north of the ladders, looking south
+    ok, why = judge(e, facing, objs)                                          # (#44 is the nearer one from there)
+    assert ok and "facing it" in why and 0.9 < facing["spl"] <= 1.0           # straight-line SPL recorded
+    away = dict(base, final_xy=[-2.1, -8.9], final_yaw=math.pi / 2)           # same spot, back to it
+    ok, why = judge(e, away, objs)
+    assert not ok and "not facing" in why and away["spl"] == 0.0              # SPL is success x ...: 0 on failure
+    tilted = dict(facing, max_tilt_rad=0.5)                                   # arrival fine, but a later check fails
+    assert not judge(e, tilted, objs)[0] and tilted["spl"] == 0.0
+    assert not judge(e, dict(base, final_xy=[-2.1, -8.9]), objs)[0]           # no heading recorded -> fail
+    turn = {"status": "done", "final_yaw_deg": 0, "yaw_tol_deg": 25}
+    assert judge(turn, dict(base, final_xy=[-2.4, 0.4], final_yaw=math.radians(6)))[0]
+    ok, why = judge(turn, dict(base, final_xy=[-2.4, 0.4], final_yaw=math.radians(-90)))
+    assert not ok and "heading" in why

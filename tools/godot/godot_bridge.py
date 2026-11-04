@@ -22,7 +22,8 @@ Published (stamped on this process's wall clock, the same as TF; map = the site'
   /camera/image_raw, /camera/depth, /camera/camera_info   one stamp per frame pair (detector pairs on it)
   /m20/health (HealthReport, node m20_godot_bridge)       ERROR while the sim is unreachable
 Consumed:
-  /cmd_vel -> vel_body (the sim mixes and steers itself), ONLY while /m20/mode says armed; zero when
+  /cmd_vel (GODOT_CMD_TOPIC; Real-time B sets /cmd_vel_safe = after collision_monitor)
+      -> vel_body (the sim mixes and steers itself), ONLY while /m20/mode says armed; zero when
   disarmed or when /cmd_vel goes stale. Capped at GODOT_VMAX (0.5 m/s: the M20 can flip on furniture).
   The yaw rate is trimmed on the measured gyro (godot_io.YawTrim): the sim's M20 turns at ~50 % of the
   command, which sent DWB's arcs wide and made it drop the path.
@@ -70,6 +71,7 @@ CMD_STALE_S = 0.5
 # base_link), with margin: the full sweeps are ~155k points, this is ~10x fewer.
 ZBAND = tuple(float(v) for v in os.environ.get("GODOT_CLOUD_ZBAND", "-0.45,0.70").split(","))
 ODOM_MODE = os.environ.get("GODOT_ODOM", "truth")
+CMD_TOPIC = os.environ.get("GODOT_CMD_TOPIC", "/cmd_vel")   # velocity input (Real-time B: /cmd_vel_safe)
 RESEED_JUMP_M = 0.3            # true pose moved this much more than 1 m/s could explain since the last tick = a sim reset
 
 
@@ -120,7 +122,10 @@ class GodotBridge(Node):
 
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(RobotMode, "/m20/mode", self.on_mode, latched)
-        self.create_subscription(Twist, "/cmd_vel", self.on_cmd_vel, 10)
+        self.create_subscription(Twist, CMD_TOPIC, self.on_cmd_vel, 10)
+        if CMD_TOPIC != "/cmd_vel":            # e.g. /cmd_vel_safe: nothing moves unless collision_monitor publishes it
+            self.get_logger().info(f"velocity input: {CMD_TOPIC} (not /cmd_vel): a publisher must exist for the robot to move")
+            self.create_timer(60.0, self._check_cmd_publisher)
         self.armed, self.cmd, self.cmd_t, self.sent_zero = False, (0.0, 0.0), 0.0, True
         self.gyro_z, self.trim, self.last_tick = 0.0, gio.YawTrim(), time.monotonic()
         self.sim_ok, self.sim_err = True, ""
@@ -166,6 +171,10 @@ class GodotBridge(Node):
     # ---------------------------------------------------------------- commands
     def on_mode(self, m: RobotMode):
         self.armed = bool(m.armed)
+
+    def _check_cmd_publisher(self):
+        if self.count_publishers(CMD_TOPIC) == 0:
+            self.get_logger().warn(f"nobody publishes {CMD_TOPIC}: the robot will not move (is collision_monitor up?)")
 
     def on_cmd_vel(self, m: Twist):
         self.cmd, self.cmd_t = (m.linear.x, m.angular.z), time.monotonic()

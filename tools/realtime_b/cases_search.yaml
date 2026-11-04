@@ -1,0 +1,35 @@
+# Real-time B SEARCH eval cases (VLFM-style: frontiers + value map + live OWLv2; no maps given). Stack:
+#   bash tools/realtime_b/realtime_b_up.sh --mode search
+#   bash tools/nlnav_eval/eval.sh --drive --action /m20/vlfm/navigate --cases tools/realtime_b/cases_search.yaml --tag vlfm
+# The instruction text IS the target phrase (VLFM takes an object name, not a sentence). Object goals only: a route
+# instruction has no target to search for. Positions come from the OFFLINE object map, used here only as eval ground
+# truth (2026-10-14 map, 396 objects; ids shift on rebuild). The robot never sees it. Several objects of a class exist;
+# near_id lists the ones the offline map saw >= 10 times, the nearest listed one counts.
+#
+# expect: status done = the detector confirmed the target and the robot reached its approach pose; not_found = the
+# site was fully explored without a confirmed detection; error = timeout (5 min) or a stack failure.
+#   near_id + near_m 2.5 (any listed id: the nearest one counts), facing_deg 45: as the VLM baseline cases.
+# Recorded, never judged: frontier goals, image-text scores per tick, path length, straight-line SPL, time to detection.
+site: circuit4
+start_pose: [-2.13, 0.35, -1.6]        # the spawn, facing south down the main corridor
+cases:
+  - name: search_ladder                 # in view from the spawn, 11 m ahead: the detector should end it without exploring
+    drive: true
+    text: "ladder"
+    expect: {status: done, near_id: [27, 28, 42, 341, 165], near_m: 2.5, facing_deg: 45}
+  - name: search_trash_can              # nearest 4 m away by the first desk, out of view: one frontier away
+    drive: true
+    text: "trash can"
+    expect: {status: done, near_id: [1, 15, 30, 37, 236, 228, 311, 326], near_m: 2.5, facing_deg: 45}
+  - name: search_refrigerator           # nearest 3 m south-east by the desks (56, 83) or 5 m west (6), out of view
+    drive: true
+    text: "refrigerator"
+    expect: {status: done, near_id: [6, 56, 83, 106, 216, 223, 277, 299, 306, 319], near_m: 2.5, facing_deg: 45}
+  - name: search_traffic_cone           # east side, 9 m, around the central block
+    drive: true
+    text: "traffic cone"
+    expect: {status: done, near_id: [118, 123, 138, 185, 200], near_m: 2.5, facing_deg: 45}
+  - name: search_whiteboard             # 11-15 m away north (256) or north-west (295): a real search
+    drive: true
+    text: "whiteboard"
+    expect: {status: done, near_id: [295, 256, 205, 340], near_m: 2.5, facing_deg: 45}

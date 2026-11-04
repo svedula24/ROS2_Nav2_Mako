@@ -427,9 +427,128 @@ else
 fi
 sleep 6
 
+# Keep-away / escape knobs (unset = unchanged), for the boxed-in investigation (2026-10-19: the controller grazed a
+# 0.3 m floor pipe to within 7 cm, every trajectory and the spin/back-up recoveries then collided; nav2.log "No valid
+# trajectories out of 231"):  M20_OBSTACLE_SCALE  ObstacleFootprint critic weight (0.15 staged; higher = keep away)
+#   M20_MIN_VEL_X  DWB min_vel_x (0 staged; negative lets the controller reverse out of a corner)
+#   M20_CAM_MIN_Z  camera_layer min_obstacle_height (-0.36 staged; the floor sits at -0.43: -0.30 marks less floor noise)
+# M20_OBSTACLE_SCALE only matters on the external-sim path (ObstacleFootprint); the MuJoCo path still scores
+# BaseObstacle, where the key is written but unused. M20_CAM_MIN_Z needs the camera_layer (external sim) and fails
+# loudly without it.
+if [ -n "${M20_OBSTACLE_SCALE:-}${M20_MIN_VEL_X:-}${M20_CAM_MIN_Z:-}" ]; then
+  echo "[4.7/7] keep-away knobs: obstacle scale ${M20_OBSTACLE_SCALE:-unchanged}, min_vel_x ${M20_MIN_VEL_X:-unchanged}, camera min z ${M20_CAM_MIN_Z:-unchanged}"
+  docker exec -i -e OS="${M20_OBSTACLE_SCALE:-}" -e MV="${M20_MIN_VEL_X:-}" -e CZ="${M20_CAM_MIN_Z:-}" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+f = cfg["controller_server"]["ros__parameters"]["FollowPath"]
+if os.environ["OS"]:
+    f["ObstacleFootprint.scale"] = float(os.environ["OS"])
+if os.environ["MV"]:
+    f["min_vel_x"] = float(os.environ["MV"])
+if os.environ["CZ"]:
+    for k in ("global_costmap", "local_costmap"):
+        cfg[k][k]["ros__parameters"]["camera_layer"]["camera"]["min_obstacle_height"] = float(os.environ["CZ"])
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched:", {k: v for k, v in (("ObstacleFootprint.scale", os.environ["OS"]), ("min_vel_x", os.environ["MV"]), ("camera min z", os.environ["CZ"])) if v})
+PYEOF
+fi
+
+# Exploration-map hook (M20_EXPLORE_MAP=1; unset = unchanged): the global costmap becomes the robot's own memory of an
+# UNSEEN site, VLFM-style: non-rolling, fixed to the site's extent, starting all-unknown and filling in from the global
+# costmap's own layers (obstacle_layer on /scan, camera_layer on the depth cloud) as the robot moves (track_unknown_space).
+# Frontiers = known-free cells next to unknown ones. The extent (M20_EXPLORE_ORIGIN "x y", M20_EXPLORE_SIZE "w h",
+# metres) must cover wherever the robot may go, INCLUDING odometry drift: the defaults are circuit4's (28 x 36 m with
+# ~4 m of margin); another site needs its own.
+if [ "${M20_EXPLORE_MAP:-0}" = "1" ]; then
+  echo "[4.8/7] exploration map: global costmap non-rolling, all-unknown at start, origin ${M20_EXPLORE_ORIGIN:--12 -16} size ${M20_EXPLORE_SIZE:-28 36} m"
+  docker exec -i -e ORIGIN="${M20_EXPLORE_ORIGIN:--12 -16}" -e SIZE="${M20_EXPLORE_SIZE:-28 36}" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+g = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
+ox, oy = (float(v) for v in os.environ["ORIGIN"].split()); w, h = (float(v) for v in os.environ["SIZE"].split())
+g["rolling_window"] = False
+g["width"], g["height"], g["origin_x"], g["origin_y"] = int(w), int(h), ox, oy
+g["resolution"] = 0.1
+g["track_unknown_space"] = True
+g["unknown_cost_value"] = 255
+g["plugins"] = [pl for pl in g["plugins"] if pl != "static_layer"]
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print(f"  patched: global costmap {w:.0f}x{h:.0f} m at ({ox}, {oy}), 0.1 m cells, unknown tracked, no static layer")
+PYEOF
+fi
+
+# Real-time B hook (tools/realtime_b/realtime_b_up.sh sets it; unset = unchanged): extra Nav2 behavior plugins, e.g.
+# M20_BEHAVIORS_EXTRA=drive_on_heading (the VLM's forward moves; the stock list is spin/backup/wait).
+if [ -n "${M20_BEHAVIORS_EXTRA:-}" ]; then
+  echo "[4.9/7] extra Nav2 behaviors: $M20_BEHAVIORS_EXTRA"
+  docker exec -i -e EXTRA="$M20_BEHAVIORS_EXTRA" $C python3 - <<'PYEOF'
+import os, yaml
+p = "/cfg/nav2_params.yaml"
+cfg = yaml.safe_load(open(p))
+b = cfg["behavior_server"]["ros__parameters"]
+for name in os.environ["EXTRA"].split(","):
+    name = name.strip()
+    if name and name not in b["behavior_plugins"]:
+        b["behavior_plugins"].append(name)
+        b[name] = {"plugin": "nav2_behaviors/" + "".join(w.capitalize() for w in name.split("_"))}
+yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
+print("  patched: behavior_plugins =", b["behavior_plugins"])
+PYEOF
+fi
+
 echo "[5/7] starting Nav2 (logs -> /cfg/out/nav2.log; the 2026-07-17 lesson)"
 docker exec -d $C bash -lc "$SRC; ros2 launch nav2_bringup navigation_launch.py params_file:=/cfg/nav2_params.yaml use_sim_time:=false >/cfg/out/nav2.log 2>&1"
 sleep 14
+
+# Real-time B hook: collision_monitor between /cmd_vel and the robot (M20_COLLISION_MONITOR=1; the external-sim bridge
+# then reads /cmd_vel_safe via GODOT_CMD_TOPIC). One "approach" zone = the robot's own footprint simulated 1.2 s ahead
+# at the commanded velocity: any motion that would reach an obstacle sooner is slowed, in every direction, while
+# turning away stays possible (a fixed stop box around the body would also block turning away from a wall).
+if [ "${M20_COLLISION_MONITOR:-0}" = "1" ]; then
+  echo "[5.1/7] starting collision_monitor (/cmd_vel -> /cmd_vel_safe, footprint approach zone 1.2 s)"
+  docker exec -i $C bash -lc "cat > /cfg/collision_monitor.yaml" <<'YEOF'
+collision_monitor:
+  ros__parameters:
+    base_frame_id: base_link
+    odom_frame_id: odom
+    cmd_vel_in_topic: cmd_vel
+    cmd_vel_out_topic: cmd_vel_safe
+    transform_tolerance: 0.5
+    source_timeout: 5.0
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: polygon
+      action_type: approach
+      footprint_topic: /local_costmap/published_footprint
+      time_before_collision: 1.2
+      simulation_time_step: 0.1
+      max_points: 3
+      visualize: false
+    observation_sources: ["scan", "camera"]
+    scan:
+      type: scan
+      topic: /scan
+    camera:
+      type: pointcloud
+      topic: /camera/obstacle_points
+      min_height: -0.36
+      max_height: 0.54
+YEOF
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_collision_monitor collision_monitor --ros-args --params-file /cfg/collision_monitor.yaml >/cfg/out/collision_monitor.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_collision -p autostart:=true -p node_names:=\"['collision_monitor']\" >/cfg/out/collision_lifecycle.log 2>&1"
+  # it must really be active: with GODOT_CMD_TOPIC=/cmd_vel_safe and no monitor publishing it, the robot never moves
+  # (its lifecycle manager's log, not `ros2 lifecycle get`: the ros2 CLI's discovery can take > 5 s on this box)
+  CM_OK=0
+  for i in $(seq 1 20); do
+    docker exec $C grep -q "Managed nodes are active" /cfg/out/collision_lifecycle.log 2>/dev/null && { CM_OK=1; break; }
+    sleep 1
+  done
+  [ "$CM_OK" = "1" ] || { echo "ERROR: collision_monitor did not become active (see /cfg/out/collision_monitor.log)"; docker exec $C tail -20 /cfg/out/collision_monitor.log; exit 1; }
+  echo "  collision_monitor active"
+fi
 
 echo "[5.5/7] starting mission server (/m20/mission/run — tools/dev/m20 goto|mission)"
 docker exec -d $C bash -lc "$SRC; python3 /cfg/mission_server.py >/cfg/out/mission.log 2>&1"

@@ -1,0 +1,51 @@
+# Real-time B eval cases (NaVILA-style VLM + Nav2 behaviors, no maps). Run with the Real-time B stack up:
+#   bash tools/nlnav_eval/eval.sh --drive --action /m20/vlmnav/navigate --cases tools/realtime_b/cases.yaml --tag rtb_zeroshot
+# All cases drive (there is no plan level: the VLM decides one move at a time). Judged from the sim's ground truth.
+# Target positions come from the OFFLINE object map (~/m20_sim/semmap/circuit4/object_map.json), used here only as
+# eval ground truth: the robot never sees a map. Positions as of the 2026-10-14 map (396 objects; ids shift on rebuild).
+#
+# expect keys (see tools/nlnav_eval/cases.yaml for the shared ones):
+#   status        done = the VLM said stop; error = it never did (max 60 decisions / 5 min), gave an unparseable
+#                 reply, or 3 moves in a row were blocked; canceled = operator stop / commander veto
+#   near_id/near_xy + near_m   ended within near_m of the target's centre (near_id may list several equally right)
+#   facing_deg    the final heading points at the target within this many degrees
+#   final_yaw_deg + yaw_tol_deg   the final heading itself (for pure turn instructions); spawn faces -90 deg (south)
+# Recorded for every episode, never judged: decisions, decision latency, move sizes, how often a 1 m / 45 deg cap
+# would have triggered, blocked moves, straight-line SPL, time to arrival.
+# Two sets, scored separately (the Overview's comparison plan): object goals and route instructions.
+site: circuit4
+start_pose: [-2.13, 0.35, -1.6]        # the spawn, facing south down the main corridor
+cases:
+  # ---- sanity: does the loop execute what it says? (no perception needed) ----
+  - name: rtb_turn_left_90
+    drive: true
+    text: "turn left 90 degrees"
+    expect: {status: done, final_yaw_deg: 0, yaw_tol_deg: 25}
+  - name: rtb_forward_2m
+    drive: true
+    text: "move forward 2 meters, then stop"
+    expect: {status: done, near_xy: [-2.13, -1.65], near_m: 0.75}
+
+  # ---- object goals ----
+  - name: rtb_ladder_visible                  # ~11 m straight ahead down the corridor, in view from the spawn
+    drive: true
+    text: "go to the ladder"
+    expect: {status: done, near_id: [28, 44], near_m: 2.5, facing_deg: 45}
+  - name: rtb_trash_can                       # #1 is 4 m away, off to the right behind the first desk
+    drive: true
+    text: "find a trash can and stop in front of it"
+    expect: {status: done, near_id: [1, 126, 228, 236], near_m: 2.5, facing_deg: 45}
+  - name: rtb_fridge                          # #71 / #6 at the west side, 5 m away
+    drive: true
+    text: "go to the refrigerator"
+    expect: {status: done, near_id: [71, 6, 75, 83], near_m: 2.5, facing_deg: 45}
+
+  # ---- route instructions ----
+  - name: rtb_route_corridor_desk             # straight down the corridor, stop by the desks on the left (#3/#76)
+    drive: true
+    text: "go straight down the corridor and stop next to the first desk on your left"
+    expect: {status: done, near_id: [3, 76], near_m: 2.5}
+  - name: rtb_route_turn_around_back          # pure dead reckoning: a 180 and 2 m back toward the north end
+    drive: true
+    text: "turn around and walk 2 meters, then stop"
+    expect: {status: done, near_xy: [-2.13, 2.35], near_m: 1.0, final_yaw_deg: 90, yaw_tol_deg: 35}

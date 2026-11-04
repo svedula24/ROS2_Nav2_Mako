@@ -44,7 +44,7 @@ def main():
     sums = [summarize(r) for r in runs]
     tags = [r.get("tag", "?") for r in runs]
     print("run        | " + " | ".join(f"{t:>14}" for t in tags))
-    print("config     | " + " | ".join(f"{(r.get('config') or {}).get('model', '?')[:14]:>14}" for r in runs))
+    print("config     | " + " | ".join(f"{str((r.get('config') or {}).get('model') or '?')[:14]:>14}" for r in runs))
     print("localiz.   | " + " | ".join(f"{(r.get('config') or {}).get('localization', 'gt'):>14}" for r in runs))
     names = [c["name"] for c in runs[0]["cases"]]
     print("-" * (13 + 17 * len(runs)))

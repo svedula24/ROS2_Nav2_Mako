@@ -55,7 +55,7 @@ def rpy(q):
 
 
 class Eval(Node):
-    def __init__(self):
+    def __init__(self, action="/m20/nlnav/navigate"):
         super().__init__("nlnav_eval")
         self.lock = threading.Lock()
         self.pose = None                      # (x, y, yaw, roll, pitch, t)
@@ -72,7 +72,9 @@ class Eval(Node):
         self.mode = None
         self.create_subscription(RobotMode, "/m20/mode", lambda m: setattr(self, "mode", m),
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.client = ActionClient(self, NavigateNL, "/m20/nlnav/navigate")
+        # --action /m20/vlmnav/navigate = Real-time B (same action type; the result's detail carries the episode)
+        self.client = ActionClient(self, NavigateNL, action)
+        self.path_m, self._path_last = 0.0, None         # distance actually driven while watching (true pose)
         self.set_mode = self.create_client(SetMode, "/m20/set_mode")
         # localization check (SCAFFOLD for AMCL vs ground truth): the pose the stack BELIEVES (TF map->base_link,
         # which Nav2 plans from) against /odom_true at the same stamp. With ground-truth localization the two are
@@ -100,6 +102,10 @@ class Eval(Node):
             self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, y, r, p, time.time())
             if self.watch:
                 self.max_tilt = max(self.max_tilt, abs(r), abs(p))
+                xy = (m.pose.pose.position.x, m.pose.pose.position.y)
+                if self._path_last is not None:
+                    self.path_m += math.hypot(xy[0] - self._path_last[0], xy[1] - self._path_last[1])
+                self._path_last = xy
         if self.watch:
             self._sample_localization(m, y)
 
@@ -151,12 +157,14 @@ class Eval(Node):
         with self.lock:
             self.watch, self.max_tilt, self.fp_age_max, self.failsafe = True, 0.0, 0.0, ""
             self.loc_err, self.loc_yaw_err, self.loc_n, self.odom_err = 0.0, 0.0, 0, 0.0
+            self.path_m, self._path_last = 0.0, None
 
     def stop_watch(self):
         with self.lock:
             self.watch = False
             age = max(self.fp_age_max, self._fp_staleness_now())
-            out = {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe}
+            out = {"max_tilt_rad": self.max_tilt, "max_footprint_age_s": round(age, 2), "failsafe": self.failsafe,
+                   "path_len_m": round(self.path_m, 2)}
             if self.loc_n:
                 out.update(loc_err_max_m=round(self.loc_err, 3), loc_yaw_err_max_deg=round(self.loc_yaw_err, 2),
                            odom_err_max_m=round(self.odom_err, 3), loc_samples=self.loc_n)
@@ -233,8 +241,14 @@ def result_dict(r, wall):
         oid = int(lab.split("#")[-1]) if "#" in lab and lab.split("#")[-1].strip().isdigit() else -1
         items.append({"label": lab, "id": oid, "x": round(p.x, 3), "y": round(p.y, 3), "yaw": round(rpy(q)[2], 3)})
     cands = [{"id": c.object_id, "label": c.cls, "score": round(float(c.score), 3), "why": c.why} for c in r.candidates[:5]]
-    return {"status": r.status, "success": bool(r.success), "interpretation": r.interpretation, "items": items,
-            "candidates": cands, "latency_ms": round(float(r.latency_ms), 1), "detail": r.detail, "wall_s": round(wall, 2)}
+    out = {"status": r.status, "success": bool(r.success), "interpretation": r.interpretation, "items": items,
+           "candidates": cands, "latency_ms": round(float(r.latency_ms), 1), "detail": r.detail, "wall_s": round(wall, 2)}
+    if r.detail.startswith("{"):                         # Real-time B: the episode summary (decisions, moves, log)
+        try:
+            out["episode"] = json.loads(r.detail)
+        except ValueError:
+            pass
+    return out
 
 
 def failed_attempt(status, detail):
@@ -269,6 +283,8 @@ def main():
     ap.add_argument("--config", default="{}")
     ap.add_argument("--object-map", default="")
     ap.add_argument("--only", default="")
+    ap.add_argument("--action", default="/m20/nlnav/navigate",
+                    help="NavigateNL action to drive: /m20/nlnav/navigate (offline) or /m20/vlmnav/navigate (Real-time B)")
     a = ap.parse_args()
     spec = yaml.safe_load(open(a.cases))
     start = spec.get("start_pose", [0, 0, 0])
@@ -282,12 +298,12 @@ def main():
             objects[int(o["id"])] = (o["xyz"][0], o["xyz"][1])
 
     rclpy.init()
-    node = Eval()
+    node = Eval(a.action)
     if not node.client.wait_for_server(timeout_sec=15):
-        print("ERROR: NL navigation action not available"); sys.exit(1)
+        print(f"ERROR: action {a.action} not available"); sys.exit(1)
     node.spin_for(1.0)
     run = {"tag": a.tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "drive": a.drive, "config": json.loads(a.config),
-           "start_pose": start, "cases": []}
+           "start_pose": start, "action": a.action, "cases": []}
     print(f"[eval] {len(cases)} {'drive' if a.drive else 'plan'}-level cases x{a.repeat}; resetting the robot to the spawn")
     if not reset_robot(node, start):
         print(f"[eval] WARNING: the robot did not reach the start pose {start[:2]}; plan cases depend on it")
@@ -339,6 +355,9 @@ def main():
                 att.update(node.stop_watch())
                 xy = node.xy()
                 att["final_xy"] = [round(xy[0], 3), round(xy[1], 3)] if xy else None
+                with node.lock:
+                    att["final_yaw"] = round(node.pose[2], 4) if node.pose else None
+                att["start_xy"] = [round(start[0], 3), round(start[1], 3)]
             else:
                 r, wall, out = node.say(c["text"], True, limit_s=60.0)
                 att.update(result_dict(r, wall) if r is not None else failed_attempt(out, f"dry-run goal {out}"))

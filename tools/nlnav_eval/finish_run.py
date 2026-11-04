@@ -46,6 +46,13 @@ for c in run["cases"]:
         odom = [a.get("odom_err_max_m") for a in att if a.get("odom_err_max_m") is not None]
         print(f"{'':<32} localization: max error {max(loc):.2f} m, yaw {max(a.get('loc_yaw_err_max_deg') or 0 for a in att):.1f} deg "
               f"(believed pose vs ground truth)" + (f"; raw odometry drift up to {max(odom):.2f} m" if odom else ""))
+    eps = [a["episode"] for a in att if a.get("episode")]
+    if eps:                                              # Real-time B: what the VLM did
+        e = eps[-1]
+        print(f"{'':<32} episode: {e.get('decisions')} decisions in {e.get('seconds')} s, median decision "
+              f"{e.get('median_latency_ms')} ms, moves {e.get('moves')}, blocked {e.get('blocked_moves')}, "
+              f"1 m/45 deg cap would trigger {e.get('cap_would_trigger')}x, path {att[-1].get('path_len_m')} m"
+              + (f", SPL {att[-1]['spl']}" if att[-1].get('spl') is not None else "") + f", end: {e.get('end_reason')}")
 v = [verdict(c) for c in run["cases"]]
 known = [c for c in run["cases"] if c.get("known_issue")]
 print(f"{v.count('PASS')}/{len(v) - len(known)} pass (excluding known issues); NEW FAILURES: {v.count('FAIL')}; "

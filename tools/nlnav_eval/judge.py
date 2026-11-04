@@ -2,7 +2,10 @@
 ROS container and by the unit tests). An attempt is a plain dict:
   {"status": str, "items": [{"label": str, "id": int, "x": float, "y": float}], ...}
 and for drive cases also {"final_xy": [x, y], "max_tilt_rad": float, "max_footprint_age_s": float,
-  "stop_drift_m": float}. Returns (passed, why)."""
+  "stop_drift_m": float}. Returns (passed, why).
+near_id as a list (2026-10-19): the attempt passes if ANY listed id meets near_m (and facing_deg); the reference used
+to be the NEAREST listed id, which failed a search that had approached another listed object. A single id is judged
+exactly as before."""
 import math
 
 
@@ -10,10 +13,23 @@ def _norm(label):
     return (label or "").split(" #")[0].strip().lower()
 
 
+def facing_off_deg(fx, fy, yaw, tx, ty):
+    """How far (degrees, >= 0) the heading `yaw` at (fx, fy) is off the direction to (tx, ty)."""
+    return math.degrees(abs(math.remainder(math.atan2(ty - fy, tx - fx) - yaw, 2 * math.pi)))
+
+
 def judge(expect: dict, attempt: dict, objects: dict = None, localization: str = None):
     """objects: {id: (x, y)} map positions for drive-level `near_id` checks.
     localization: the run's localization mode (eval.sh config): gt | amcl | odom. Under "odom" (drifting odometry, no
     correction: the baseline that shows what drift does) the localization limits are recorded, not judged."""
+    ok, why = _judge(expect, attempt, objects, localization)
+    spl = attempt.pop("_spl_if_success", None)
+    if spl is not None:                                     # SPL = success x l / max(p, l): 0 for a failed attempt
+        attempt["spl"] = spl if ok else 0.0
+    return ok, why
+
+
+def _judge(expect, attempt, objects, localization):
     why = []
     st = attempt.get("status")
     if st != expect.get("status"):
@@ -64,9 +80,23 @@ def judge(expect: dict, attempt: dict, objects: dict = None, localization: str =
         if "near_xy" in expect:
             tx, ty = expect["near_xy"]
         elif "near_id" in expect:
-            if not objects or expect["near_id"] not in objects:
+            # one id, or a list = any of them is right. Judge against the listed one the robot actually ended at:
+            # the first that meets near_m (and facing_deg when asked); if none does, the nearest, so the report
+            # says how far off it was. (Before 2026-10-19 the NEAREST listed id was always the reference, so a
+            # search that approached listed fridge #223 was measured against #216 behind it and failed "facing".)
+            ids = expect["near_id"] if isinstance(expect["near_id"], (list, tuple)) else [expect["near_id"]]
+            known = [objects[i] for i in ids if objects and i in objects]
+            if not known:
                 return False, f"object {expect['near_id']} position unknown"
-            tx, ty = objects[expect["near_id"]]
+            yaw0 = attempt.get("final_yaw")
+            def _ok(o):
+                if math.hypot(fx - o[0], fy - o[1]) > expect["near_m"]:
+                    return False
+                if "facing_deg" in expect and yaw0 is not None:
+                    return facing_off_deg(fx, fy, yaw0, o[0], o[1]) <= expect["facing_deg"]
+                return True
+            good = [o for o in known if _ok(o)]
+            tx, ty = good[0] if good else min(known, key=lambda o: math.hypot(fx - o[0], fy - o[1]))
         elif items:
             tx, ty = items[-1]["x"], items[-1]["y"]
         else:
@@ -75,6 +105,28 @@ def judge(expect: dict, attempt: dict, objects: dict = None, localization: str =
         if d > expect["near_m"]:                                # sanity bound: a wrong approach pose can't pass
             return False, f"ended {d:.2f} m from the target (limit {expect['near_m']})"
         why.append(f"{d:.2f} m from target")
+        # straight-line SPL (success x shortest / actual path, with the straight line standing in for the shortest
+        # path, so it's pessimistic); recorded, never judged. Finalised in judge(): 0 unless every check passes.
+        if attempt.get("path_len_m") and attempt.get("start_xy"):
+            sx, sy = attempt["start_xy"]
+            straight = math.hypot(tx - sx, ty - sy)
+            attempt["_spl_if_success"] = round(straight / max(attempt["path_len_m"], straight), 3)
+        if "facing_deg" in expect:                              # Real-time B: "stops near the object, facing it"
+            yaw = attempt.get("final_yaw")
+            if yaw is None:
+                return False, "no final heading"
+            off = facing_off_deg(fx, fy, yaw, tx, ty)
+            if off > expect["facing_deg"]:
+                return False, f"not facing the target: off by {off:.0f} deg (limit {expect['facing_deg']})"
+            why.append(f"facing it ({off:.0f} deg off)")
+    if "final_yaw_deg" in expect:                               # e.g. "turn left 90 degrees": heading, not position
+        yaw = attempt.get("final_yaw")
+        if yaw is None:
+            return False, "no final heading"
+        off = math.degrees(abs(math.remainder(math.radians(expect["final_yaw_deg"]) - yaw, 2 * math.pi)))
+        if off > expect.get("yaw_tol_deg", 20):
+            return False, f"heading {math.degrees(yaw):.0f} deg, expected {expect['final_yaw_deg']} (off by {off:.0f})"
+        why.append(f"heading within {off:.0f} deg")
     if attempt.get("max_tilt_rad") is not None and attempt["max_tilt_rad"] > 0.3:
         return False, f"tilted {attempt['max_tilt_rad']:.2f} rad during the drive"
     if attempt.get("max_footprint_age_s") is not None and attempt["max_footprint_age_s"] > 3.0:
