@@ -15,7 +15,7 @@ knows the camera pose exactly and can project the boxes; nothing here blocks the
 {"cmd":"screenshot"} does, and corrupts odometry: see tools/demo/README.md). Needs the stack up (demo_up.sh).
 Keys: q quit (cancels a running goal), t toggle the true pose on the map, b toggle boxes in the chase view.
 """
-import argparse, ctypes, ctypes.wintypes as w, glob, json, math, os, socket, subprocess, sys, threading, time
+import argparse, ctypes, ctypes.wintypes as w, glob, json, math, os, subprocess, sys, threading, time
 from collections import deque
 
 import cv2
@@ -23,13 +23,15 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, os.path.join(REPO, "tools", "godot"))
+from godot_io import Api as SimApi, enu_to_godot, quat_to_rpy  # noqa: E402  (the sim's API client; no Godot in it)
 REPO_WSL = "/mnt/" + REPO[0].lower() + REPO[2:].replace("\\", "/")
 WSL = ["wsl.exe", "-d", "Ubuntu-24.04", "--"]
 SRC = ("source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; "
        "export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp PYTHONUNBUFFERED=1")
 MAP_YAML = os.path.join(REPO, "tools", "sim", "godot_circuit4_map.yaml")
-OBJECT_MAP_WSL = "~/m20_sim/semmap/circuit4/object_map.json"
-MIN_LABEL_SCORE = 0.4            # the navigator's own cut (nlnav_up.sh --min-label-score)
+OBJECT_MAP_WSL = "~/m20_sim/semmap/circuit4/object_map.json"     # fallback when m20_nlnav is not inspectable
+MIN_LABEL_SCORE = 0.4            # fallback for the navigator's cut (nlnav_up.sh --min-label-score)
 VFOV_DEG = 75.0                  # the spectator is a stock Camera3D: Godot's default vertical FOV
 CHASE_OFFSET = (0.0, 1.0, 2.2)   # spectator.gd GROUND_CHASE_OFFSET (Godot: x right, y up, z back), in the heading frame
 CHASE_LOOK_UP = 0.35             # spectator.gd GROUND_CHASE_LOOK_UP
@@ -41,42 +43,8 @@ MAP_PX_PER_M = 27.0
 ORANGE, CYAN, GREEN, WHITE, RED, YELLOW = (0, 140, 255), (220, 200, 60), (90, 220, 90), (255, 255, 255), (60, 60, 230), (60, 220, 240)
 
 
-# ---------------------------------------------------------------- the sim's API (persistent connection)
-class SimApi:
-    def __init__(self, host="127.0.0.1", port=7799):
-        self.addr, self.s = (host, port), None
-
-    def call(self, d, timeout=3.0):
-        for attempt in (0, 1):
-            try:
-                if self.s is None:
-                    self.s = socket.create_connection(self.addr, timeout=timeout)
-                self.s.sendall((json.dumps(d) + "\n").encode())
-                b = b""
-                while not b.endswith(b"\n"):
-                    chunk = self.s.recv(1 << 16)
-                    if not chunk:
-                        raise ConnectionError("closed")
-                    b += chunk
-                return json.loads(b)
-            except (OSError, ValueError):
-                try:
-                    self.s.close()
-                except Exception:
-                    pass
-                self.s = None
-                if attempt:
-                    raise
-        return {}
-
-
-def enu_to_godot(p):
-    return (p[0], p[2], -p[1])
-
-
 def yaw_of(q):
-    x, y, z, w_ = q
-    return math.atan2(2.0 * (w_ * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return quat_to_rpy(*q)[2]
 
 
 # ---------------------------------------------------------------- window capture (PrintWindow, works off-screen)
@@ -114,19 +82,21 @@ class Grabber:
         self.buf = ctypes.create_string_buffer(self.W * self.H * 4)
         self.box = self._content_box()
 
+    PW_CLIENTONLY, PW_RENDERFULLCONTENT = 1, 2       # client area only (the bitmap is client-sized), GPU content too
+
     def grab_raw(self):
-        self.u32.PrintWindow(self.hwnd, self.mdc, 2)
+        self.u32.PrintWindow(self.hwnd, self.mdc, self.PW_CLIENTONLY | self.PW_RENDERFULLCONTENT)
         self.g32.GetDIBits(self.mdc, self.bmp, 0, self.H, self.buf, ctypes.byref(self.bmi), 0)
-        return np.frombuffer(self.buf.raw, np.uint8).reshape(self.H, self.W, 4)[:, :, :3]
+        return np.frombuffer(self.buf, np.uint8).reshape(self.H, self.W, 4)[:, :, :3]     # a view: no copy
 
     def _content_box(self):
-        """The rendered area: the capture carries the title bar and a black margin around the viewport."""
+        """The rendered area inside the client capture: Godot keeps the viewport's aspect, so there can be a black
+        margin on two sides; the box is the lit area (even-sized for the encoder)."""
         g = cv2.cvtColor(self.grab_raw(), cv2.COLOR_BGR2GRAY)
-        top = 40 if self.H > 200 else 0
-        ys, xs = np.where(g[top:] > 8)
+        ys, xs = np.where(g > 8)
         if len(xs) == 0:
-            return (0, top, self.W, self.H)
-        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min() + top, ys.max() + 1 + top
+            return (0, 0, self.W, self.H)
+        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
         return (int(x0), int(y0), int(x1 - ((x1 - x0) % 2)), int(y1 - ((y1 - y0) % 2)))
 
     def grab(self):
@@ -185,6 +155,12 @@ class Relay:
                 self.log.append(line[:160])
         self.alive = False
 
+    def trail_copy(self):
+        """A snapshot of the trail: the reader thread appends to the deque, and a deque being iterated on another
+        thread raises 'deque mutated during iteration'."""
+        with self.lock:
+            return list(self.trail)
+
     def send(self, text):
         self.p.stdin.write(f"send {text}\n")
         self.p.stdin.flush()
@@ -206,11 +182,36 @@ class Relay:
 
 
 # ---------------------------------------------------------------- data: object map + site map
+def navigator_settings():
+    """(object map path inside m20_nlnav, min_label_score) as the running navigator was started (nlnav_up.sh passes
+    them as ROS params on its command line), or (None, None) when the container cannot be inspected."""
+    try:
+        raw = subprocess.run(WSL + ["docker", "inspect", "m20_nlnav", "--format", "{{json .Args}}"],
+                             capture_output=True, check=True, timeout=20).stdout
+        text = " ".join(json.loads(raw))
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None, None
+    path = score = None
+    for tok in text.replace("'", " ").split():
+        if tok.startswith("object_map:="):
+            path = tok.split(":=", 1)[1]
+        elif tok.startswith("min_label_score:="):
+            score = float(tok.split(":=", 1)[1])
+    return path, score
+
+
 def load_object_map():
-    raw = subprocess.run(WSL + ["bash", "-c", f"cat {OBJECT_MAP_WSL}"], capture_output=True, check=True).stdout
+    """The navigator's own object map and label cut, so the boxes and ids drawn are the ones it resolves against."""
+    path, score = navigator_settings()
+    if path:
+        raw = subprocess.run(WSL + ["docker", "exec", "m20_nlnav", "cat", path], capture_output=True, check=True).stdout
+    else:
+        print(f"object map: m20_nlnav not inspectable, using {OBJECT_MAP_WSL} and {MIN_LABEL_SCORE}", flush=True)
+        raw = subprocess.run(WSL + ["bash", "-c", f"cat {OBJECT_MAP_WSL}"], capture_output=True, check=True).stdout
+    cut = score if score is not None else MIN_LABEL_SCORE
     d = json.loads(raw)
-    objs = [o for o in d["objects"] if o.get("label_score", 0) >= MIN_LABEL_SCORE]
-    return objs, len(d["objects"])
+    objs = [o for o in d["objects"] if o.get("label_score", 0) >= cut]
+    return objs, len(d["objects"]), cut
 
 
 class SiteMap:
@@ -388,8 +389,9 @@ def draw_view(view, cam, objs, target, relay, show_boxes, status, instruction):
 def draw_map(sm, static, objs, target, relay, show_true, true_pose):
     m = static.copy()
     # trail, plan, goal
-    if len(relay.trail) > 1:
-        pts = np.array([sm.px(x, y) for x, y in relay.trail], np.int32)
+    trail = relay.trail_copy()
+    if len(trail) > 1:
+        pts = np.array([sm.px(x, y) for x, y in trail], np.int32)
         cv2.polylines(m, [pts], False, (120, 120, 255), 2, cv2.LINE_AA)
     if relay.plan:
         pts = np.array([sm.px(x, y) for x, y in relay.plan], np.int32)
@@ -478,8 +480,8 @@ def main():
     print(f"sim: {st.get('scene')} {st.get('fps', 0):.0f} fps", flush=True)
     api.call({"cmd": "camview", "on": False})
     api.call({"cmd": "follow", "on": False})          # the viewer places the spectator itself
-    objs, n_all = load_object_map()
-    print(f"object map: {len(objs)} of {n_all} objects kept (label score >= {MIN_LABEL_SCORE})", flush=True)
+    objs, n_all, cut = load_object_map()
+    print(f"object map: {len(objs)} of {n_all} objects kept (label score >= {cut}, the navigator's own)", flush=True)
     sm = SiteMap(MAP_YAML)
     smap = static_map(sm, objs)
     grab = Grabber()
@@ -516,7 +518,7 @@ def main():
     show_true, show_boxes = False, True
     cv2.namedWindow("M20 NL navigation demo", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("M20 NL navigation demo", out_w, VIEW_H)
-    t0, n, sent, still_done, t_result = time.monotonic(), 0, a.no_send, False, None
+    t0, n, n_written, sent, still_done, t_result = time.monotonic(), 0, 0, a.no_send, False, None
     period = 1.0 / a.fps
     try:
         while True:
@@ -541,7 +543,11 @@ def main():
             frame[:, view_w:view_w + map_w] = mpanel
             cv2.imshow("M20 NL navigation demo", frame)
             if ff is not None:
-                ff.stdin.write(frame.tobytes())
+                # constant-framerate stream: the frame is written once per period that has ELAPSED since the start,
+                # so a slow tick repeats it and the mp4's clock stays the wall clock (at most 5 copies per tick)
+                due = int((time.monotonic() - t0) * a.fps) + 1
+                for _ in range(max(1, min(5, due - n_written))):
+                    ff.stdin.write(frame.tobytes()); n_written += 1
             n += 1
             if not sent and time.monotonic() - t0 > 2.0:
                 relay.send(a.instruction)
@@ -581,7 +587,7 @@ def main():
         if ff is not None:
             ff.stdin.close()
             ff.wait()
-            print(f"saved {mp4} ({n} frames, {os.path.getsize(mp4) / 1e6:.1f} MB)", flush=True)
+            print(f"saved {mp4} ({n_written} frames, {n} ticks, {os.path.getsize(mp4) / 1e6:.1f} MB)", flush=True)
         api.call({"cmd": "follow", "on": True})
         cv2.destroyAllWindows()
     print(f"sim fps at the end: {api.call({'cmd': 'state'}).get('fps', 0):.0f}", flush=True)

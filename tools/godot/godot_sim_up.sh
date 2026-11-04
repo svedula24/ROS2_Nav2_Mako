@@ -131,9 +131,32 @@ M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
 M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="${GODOT_VMAX:-0.5}" bash "$REPO/tools/nav/bringup_plan_a.sh"
 # the mission server (m20 say / goto) needs ASSISTED; bringup leaves TELEOP
 SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
-arm() { docker exec docker-commander-1 bash -lc "$SRC; ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: godot_sim_up}'" | grep -c "accepted=True" || true; }
-if [ "$(arm 2)" = "0" ]; then arm 0 >/dev/null; arm 2 >/dev/null; fi   # refused (e.g. latched ESTOP): via IDLE
-echo "[godot_sim_up] armed ASSISTED"
+arm() { docker exec docker-commander-1 bash -lc "$SRC; timeout 15 ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: godot_sim_up}' 2>/dev/null" | grep -c "accepted=True" || true; }
+ARMED=0
+for i in 1 2 3; do                                   # refused (a latched ESTOP, a commander still settling): via IDLE
+  [ "$(arm 2)" = "1" ] && { ARMED=1; break; }
+  arm 0 >/dev/null; sleep 2
+done
+[ "$ARMED" = "1" ] || { echo "[godot_sim_up] ERROR: the commander refused ASSISTED 3 times (check /m20/failsafe: docker logs docker-commander-1)"; exit 1; }
+# the service said accepted; /m20/mode (latched, published on change) is what the mission server reads. Read with a
+# transient_local subscriber in rclpy: `ros2 topic echo` goes through the CLI daemon, which is wedged on this
+# container often enough that the read came back empty after 25 s (2026-11-04) while rclpy had the sample at once.
+MODE=$(docker exec -i docker-commander-1 bash -lc "$SRC; python3 -" <<'PY'
+import time, rclpy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from m20_msgs.msg import RobotMode
+rclpy.init(); n = rclpy.create_node("arm_probe"); got = []
+n.create_subscription(RobotMode, "/m20/mode", got.append,
+                      QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE))
+t = time.monotonic()
+while not got and time.monotonic() - t < 15:
+    rclpy.spin_once(n, timeout_sec=0.2)
+print(got[-1].mode if got else "")
+rclpy.shutdown()
+PY
+)
+[ "$MODE" = "2" ] || { echo "[godot_sim_up] ERROR: /m20/mode reads '$MODE' after an accepted arm (expected 2 = ASSISTED)"; exit 1; }
+echo "[godot_sim_up] armed ASSISTED (verified on /m20/mode)"
 
 # 4a. local LLM for the structured query (kept running across launches: the model stays loaded)
 if [ "$LLM" = "ollama" ]; then
