@@ -1,146 +1,148 @@
-# ROS2 Quadruped Robot NavSystem
+# ROS2_Nav2_Mako
 
-PX4-style autonomy stack for a wheel-legged quadruped (Deep Robotics Lynx
-M20 Pro), built for oil & gas site inspection. ROS 2 Humble, Nav2, MuJoCo.
+Autonomy stack for the Deep Robotics Lynx M20 Pro, a wheel-legged quadruped for site inspection:
+ROS 2 Humble, Nav2, a commander with arming and failsafes, and natural-language navigation
+("go to the ladder") that runs on three simulators and is built to move to the robot unchanged.
 
-**Start here → [`docs/ONBOARDING.md`](docs/ONBOARDING.md)** — where the project
-stands, how to work in this codebase, and the ROS 2 (Python + C++) skill path.
-
-Then, as needed:
+**Start here:** [`docs/ONBOARDING.md`](docs/ONBOARDING.md) for how the project is organised and how to
+work in it, then [`CLAUDE.md`](CLAUDE.md) for the checks every change has to pass.
 
 | Document | For |
 |---|---|
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | current milestone and the gate that closes it — read every session |
 | [`docs/RUN_GUIDE.md`](docs/RUN_GUIDE.md) | every command: bringup, driving, maps, gates, videos, troubleshooting |
-| [`docs/NAV2_ARCHITECTURE.md`](docs/NAV2_ARCHITECTURE.md) | how the navigation stack fits together (standalone explainer) |
-| [`docs/LESSONS_LEARNED.md`](docs/LESSONS_LEARNED.md) | every hard-won lesson: symptom → cause → fix → rule |
+| [`docs/NL_NAVIGATION.md`](docs/NL_NAVIGATION.md), [`docs/NL_NAVIGATION_DESIGN.md`](docs/NL_NAVIGATION_DESIGN.md) | natural-language navigation: requirements and the design that was built |
+| [`docs/SPLAT_DEMO.md`](docs/SPLAT_DEMO.md) | the photoreal splat simulation write-up and results |
+| [`docs/NAV2_ARCHITECTURE.md`](docs/NAV2_ARCHITECTURE.md) | how the navigation stack fits together |
 | [`docs/ENGINEERING_RULES.md`](docs/ENGINEERING_RULES.md) | the four binding rules for code in this repo |
-| [`docs/NAV2_SETUP_RUNBOOK.md`](docs/NAV2_SETUP_RUNBOOK.md) | standing a nav stack up from zero, on any robot |
-| [`docs/SECOND_BRAIN.md`](docs/SECOND_BRAIN.md) | long-term memory: ADRs, contracts, phases, changelog |
+| [`docs/LESSONS_LEARNED.md`](docs/LESSONS_LEARNED.md) | every hard-won lesson: symptom, cause, fix, rule |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/SECOND_BRAIN.md`](docs/SECOND_BRAIN.md) | milestones; ADRs, contracts, phases, changelog |
 
-**ROS 2 distro: Humble / Ubuntu 22.04** (ADR-007). The robot's onboard system runs
-Foxy, but that stays *behind the vendor boundary* — our stack talks to it through the
-`m20_locomotion_bridge` (which wraps the vendor SDK), never by joining the robot's DDS
-graph. So the whole stack is Humble; cross-distro is contained at the bridge (ADR-014/015).
-
----
-
-## What's in the build
-
-One Docker image (`m20_autonomy:latest`, ~3.6 GB) is the deployable artifact (ADR-011):
-CI builds it, the robot runs the same image.
-
-| Layer | Contents |
-|---|---|
-| Base | `ros:humble-ros-base` (Ubuntu 22.04) |
-| ROS deps | `nav2-bringup`, `robot-localization`, `foxglove-bridge`, `rosbridge-suite` |
-| Our packages | all 9 `m20_*` (see Layout below), colcon-built into `/ws/install` |
-| Vendor deps | pinned in `tools/vendor.repos`, **not** built by default — enable with `--build-arg IMPORT_VENDOR=true` (needed for the MuJoCo sim / RL, see Second Brain §6.6) |
-
-Runtime: 5 services, one per node group (`docker/compose.yaml`), host networking +
-`ROS_DOMAIN_ID=42` for DDS. Ports exposed by the station bridge: **8765** (Foxglove),
-**9090** (rosbridge).
+**ROS 2 distro: Humble / Ubuntu 22.04** (ADR-007). The robot's onboard system runs Foxy, but that stays
+behind the vendor boundary: our stack talks to it through `m20_locomotion_bridge`, never by joining the
+robot's DDS graph (ADR-014/015).
 
 ---
 
-## Running the system (Windows + WSL2)
+## What is here
 
-Docker runs **inside WSL2 Ubuntu**, not on Windows directly. Run these from **Windows
-PowerShell** (they wrap `wsl`), or drop into `wsl -d Ubuntu` and use the part after `--`.
+**The robot stack** (`src/m20_*`): one Docker image, `m20_autonomy:latest`, built by CI and run the same way
+in simulation and on the robot (ADR-011). Commander (modes, arming, failsafes, control-authority leases),
+locomotion bridge (the only gateway to the vendor SDK), Nav2 configuration and behavior trees, a mission server
+with a `RunMission` action, a behavior engine, and the operator bridge (Foxglove on **8765**, rosbridge on
+**9090**). DDS runs on `ROS_DOMAIN_ID=42` with host networking.
 
-```powershell
-# one-time: Docker Engine in WSL (see tools/ if you need to reinstall)
+**Three simulators**, all publishing the same topics and frames so the stack does not change between them:
 
-# build the image (first build ~5-10 min; rebuilds are cached)
-wsl -d Ubuntu -- bash -c "cd /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws && docker compose -f docker/compose.yaml build"
+| Simulator | Where | Used for |
+|---|---|---|
+| Godot splat sim (`tools/godot`) | a Godot build of a real site scan, native Windows, driven over a local JSON API | the main development and demo platform: AMCL on a site map, the object map, every NL navigation mode |
+| Gazebo Harmonic (`tools/gazebo`) | gz-sim in WSL, generated M20 model, indoor rooms world | the standard-simulator counterpart; the same launchers with `RTB_SIM=gazebo` |
+| MuJoCo + Gaussian splat (`tools/splat`, `tools/mujoco_sim.py`) | MuJoCo physics inside a photoreal splat of an office, Viser in the browser | the first photoreal demo and the semantic mapping tour |
 
-# bring the stack UP (detached)
-wsl -d Ubuntu -- bash -c "cd /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws && docker compose -f docker/compose.yaml up -d"
+**Natural-language navigation**, two phases that share the detector, the mission server and the behaviors:
 
-# status (look for 'healthy')
-wsl -d Ubuntu -- bash -c "cd /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws && docker compose -f docker/compose.yaml ps"
+- **Offline phase** (`src/m20_nlnav`): a mapping tour builds a semantic object map of the site once
+  (`tools/semmap`); at run time a local LLM (Ollama) resolves the instruction against that map and Nav2 drives
+  there. Handles objects, named waypoints, relations ("the chair next to the whiteboard"), attributes and
+  multi-step routes. Evaluated by `tools/nlnav_eval`.
+- **Real-time B** (`src/m20_vlmnav`, `tools/realtime_b`): no maps at all. Either a vision-language model picks
+  the next short move from the camera (`vlm` mode), or a VLFM-style search ranks exploration frontiers with a
+  value map scored by an image-text model, and a live open-vocabulary detector ends the search and starts the
+  approach (`search` mode). Typed instructions ("go forward 5 m, then turn left") are parsed into exact legs.
 
-# logs for one service
-wsl -d Ubuntu -- bash -c "cd /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws && docker compose -f docker/compose.yaml logs -f commander"
+**Demo view** (`tools/demo`): the robot's chase camera with the object boxes, the plan and the instruction's
+progress drawn over it, next to the semantic map, recorded to MP4.
 
-# stack DOWN (stop + remove containers)
-wsl -d Ubuntu -- bash -c "cd /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws && docker compose -f docker/compose.yaml down"
+---
 
-# fully power off Docker + the WSL VM (free RAM/CPU)
-wsl --shutdown
-```
+## Running it (Windows + WSL2)
 
-Expected healthy state: `commander`, `locomotion_bridge`, `mission_server`,
-`behavior_engine` report **(healthy)**; `station_bridge` reports **Up** (it has no
-ROS heartbeat, only process-level restart).
-
-### Inspecting the running system (ros2 CLI)
-
-ROS is **not** on your host/WSL shell — it lives in the image. Use the helper, which
-runs any `ros2` command in a throwaway container on the stack's DDS domain:
+The ROS containers run in Docker inside WSL2. The Godot sim runs on Windows; WSL mirrored networking lets the
+containers reach it. Run the launchers from a WSL shell in the repository root; each stays in the foreground
+and tears the stack down on Ctrl-C.
 
 ```bash
-# from WSL, in the repo root:
-bash tools/ros2.sh topic list
-bash tools/ros2.sh topic echo /m20/mode
-bash tools/ros2.sh topic hz /m20/health
-bash tools/ros2.sh node list
-```
-```powershell
-# or from Windows PowerShell:
-wsl -d Ubuntu -- bash /mnt/c/GIT/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws/tools/ros2.sh topic list
+# Godot sim + commander + Nav2 (AMCL on the site map) + mission server + offline NL navigation
+bash tools/godot/godot_sim_up.sh
+tools/dev/m20 say "go to the ladder"            # natural language via the mission server
+tools/dev/m20 goto 3.0 -1.5                      # one map-frame goal
+tools/dev/m20 status                             # mode / failsafe / behavior snapshot
+
+# Real-time B on the same sim (no maps): VLM moves, or the frontier search
+bash tools/realtime_b/realtime_b_up.sh --mode vlm
+tools/dev/m20 vlm "go to the ladder"
+bash tools/realtime_b/realtime_b_up.sh --mode search
+tools/dev/m20 search "refrigerator"
+
+# Gazebo instead of Godot
+docker build -f docker/Dockerfile.gazebo -t m20_gazebo:latest docker        # once
+bash tools/gazebo/gazebo_sim_up.sh                                          # or RTB_SIM=gazebo with the launcher above
+
+# the demo view (launcher in WSL, viewer on Windows)
+bash tools/demo/demo_up.sh
+python tools\demo\nlnav_demo_viewer.py "go to the ladder" --record ladder
+
+# when done: stop the containers and the sim
+bash tools/godot/godot_sim_down.sh
 ```
 
-### Operator view (Foxglove) — ADR-013
+The commander refuses missions unless it is armed in ASSISTED or AUTONOMOUS (ADR-005); the launchers arm it
+and verify the mode on `/m20/mode` before reporting ready. `/m20/mode` is latched, so a subscriber needs
+transient-local QoS. The `ros2` CLI daemon inside the commander container can wedge; `tools/ros2.sh` runs a
+command in a fresh container, and ROS state is best read with a small rclpy script.
 
-Install **Foxglove Studio** on Windows, choose "Open connection", and connect to
-`ws://localhost:8765`. You get live 3D/plots of `/m20/health`, `/m20/mode`,
-`/m20/failsafe`, etc. with zero custom UI. rosbridge is on `ws://localhost:9090`.
+**Operator view:** Foxglove Studio, "Open connection", `ws://localhost:8765`.
 
 ---
 
-## Simulation preview — see the robot
-
-Standalone MuJoCo view of the vendor M20 model. Physics runs but nothing controls the
-16 joints yet, so the robot settles under gravity — this is a visual check, not the
-full sim. Making it stand/walk + publish on the ROS bus is Phase 1, step 2.
-
-```powershell
-# one-time GUI prerequisite (mesa/OpenGL for WSLg; needs sudo)
-wsl -d Ubuntu -- bash /mnt/c/git/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws/tools/install_gui_deps.sh
-
-# install mujoco + fetch the pinned M20 model (no sudo)
-wsl -d Ubuntu -- bash /mnt/c/git/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws/tools/setup_sim.sh
-
-# open the viewer (drag=orbit, scroll=zoom, Space=pause; close window to exit)
-wsl -d Ubuntu -- bash /mnt/c/git/StatefullXOne/m20_autonomy_ws/m20_autonomy_ws/tools/view_sim.sh
-```
-With `make` installed: `make gui-deps` / `make sim-setup` / `make sim-view`. The model
-lands in `~/m20_sim`, pinned to the `sdk_deploy` commit in `tools/vendor.repos`.
-
-## Test pyramid (Second Brain §6.6)
+## Tests and CI
 
 ```bash
-make unit    # 24 fast logic tests (pytest + rclpy shims), no ROS/Docker needed
-make image   # build the container
-make test    # colcon test inside the container (integration)
-make up      # run the full stack
+make unit    # ROS-free logic tests (pytest + rclpy shims), seconds, no Docker; CI runs these first
+make image   # build the stack image
+make test    # colcon test inside the image (integration)
 ```
-`make unit` runs anywhere in seconds and CI runs it first. Keep node logic testable at
-this level: side-effects behind injectable objects, state machines as plain methods.
+
+Every push and pull request runs `.github/workflows/ci.yaml`: `static` (bash -n, ShellCheck, Python compile),
+`unit`, and `build-and-test`; `publish-image` is a manual dispatch to GHCR. Keep node logic testable at the
+unit level: side effects behind injectable objects, state machines as plain methods.
+
+## How changes land
+
+The default branch is `3dgs-sim-nl-navigation-offline`. It is protected: changes arrive by pull request, the
+three CI jobs must pass on an up-to-date branch, and review conversations must be resolved.
+
+1. Branch from the default branch, make the change with its test, run `make unit`.
+2. Run `/code-review` in Claude Code before pushing; fix what it finds.
+3. Open the PR with the template (summary with the measured reason, test plan, review notes).
+4. `.github/workflows/claude-code-review.yml` runs the same review on the PR and posts its findings as
+   comments; `@claude` in a comment asks for a specific follow-up. Address each Important finding or answer it.
+5. Merge when CI is green and the branch is current (use "Update branch" if it fell behind).
+
+`CLAUDE.md` holds the project rules the reviews apply; `REVIEW.md` tunes what the hosted review reports.
+Commit messages give the measured reason for a change. `notes/`, `.claude/` and editor workspace files are
+never committed.
 
 ---
 
 ## Layout
-- `src/m20_msgs` — interface contracts (designed first)
-- `src/m20_locomotion_bridge` — sole gateway to the Deep Robotics SDK; cmd/gait + watchdog
-- `src/m20_commander` — modes, arming, failsafes, control-authority leases
-- `src/m20_navigation` — Nav2 config + behavior trees
-- `src/m20_perception` — SLAM / EKF / costmap config
-- `src/m20_missions` — mission server + AI agent interface
-- `src/m20_behaviors` — behavior engine + plugins (camera_scan, self_right, …)
-- `src/m20_station` — operator bridge (foxglove_bridge + rosbridge)
-- `src/m20_bringup` — top-level launch
-- `docker/` — Dockerfile, compose, healthcheck, entrypoint
-- `tools/vendor.repos` — pinned vendor/third-party dependencies
-- `tools/ros2.sh` — run ros2 CLI against the running stack
+
+- `src/m20_msgs` interface contracts (designed first)
+- `src/m20_locomotion_bridge` sole gateway to the Deep Robotics SDK; cmd/gait + watchdog
+- `src/m20_commander` modes, arming, failsafes, control-authority leases
+- `src/m20_navigation` Nav2 config + behavior trees
+- `src/m20_perception` SLAM / EKF / costmap config
+- `src/m20_missions` mission server (`RunMission`) + agent interface
+- `src/m20_behaviors` behavior engine + plugins
+- `src/m20_nlnav` offline natural-language navigation (LLM + object map)
+- `src/m20_vlmnav` Real-time B: VLM moves, VLFM-style search, instruction parsing, shared behaviors
+- `src/m20_station` operator bridge (foxglove_bridge + rosbridge)
+- `src/m20_bringup` top-level launch
+- `docker/` Dockerfiles (stack, sim, Gazebo, splat), compose, healthcheck, entrypoint
+- `tools/godot`, `tools/gazebo`, `tools/splat` the three simulators and their glue nodes
+- `tools/realtime_b` Real-time B launchers, model servers, eval cases
+- `tools/semmap`, `tools/nlnav_eval` semantic mapping tour; NL navigation evaluation harness
+- `tools/demo` the demo view and its launcher
+- `tools/dev/m20` operator CLI over the mission server
+- `tools/nav` bringup and teardown of the ROS stack (`bringup_plan_a.sh`, `kill_stack.sh`)
+- `tests/` the unit tests `make unit` runs
