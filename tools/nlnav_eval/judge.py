@@ -13,6 +13,11 @@ def _norm(label):
     return (label or "").split(" #")[0].strip().lower()
 
 
+def facing_off_deg(fx, fy, yaw, tx, ty):
+    """How far (degrees, >= 0) the heading `yaw` at (fx, fy) is off the direction to (tx, ty)."""
+    return math.degrees(abs(math.remainder(math.atan2(ty - fy, tx - fx) - yaw, 2 * math.pi)))
+
+
 def judge(expect: dict, attempt: dict, objects: dict = None, localization: str = None):
     """objects: {id: (x, y)} map positions for drive-level `near_id` checks.
     localization: the run's localization mode (eval.sh config): gt | amcl | odom. Under "odom" (drifting odometry, no
@@ -88,7 +93,7 @@ def _judge(expect, attempt, objects, localization):
                 if math.hypot(fx - o[0], fy - o[1]) > expect["near_m"]:
                     return False
                 if "facing_deg" in expect and yaw0 is not None:
-                    return math.degrees(abs(math.remainder(math.atan2(o[1] - fy, o[0] - fx) - yaw0, 2 * math.pi))) <= expect["facing_deg"]
+                    return facing_off_deg(fx, fy, yaw0, o[0], o[1]) <= expect["facing_deg"]
                 return True
             good = [o for o in known if _ok(o)]
             tx, ty = good[0] if good else min(known, key=lambda o: math.hypot(fx - o[0], fy - o[1]))
@@ -110,7 +115,7 @@ def _judge(expect, attempt, objects, localization):
             yaw = attempt.get("final_yaw")
             if yaw is None:
                 return False, "no final heading"
-            off = math.degrees(abs(math.remainder(math.atan2(ty - fy, tx - fx) - yaw, 2 * math.pi)))
+            off = facing_off_deg(fx, fy, yaw, tx, ty)
             if off > expect["facing_deg"]:
                 return False, f"not facing the target: off by {off:.0f} deg (limit {expect['facing_deg']})"
             why.append(f"facing it ({off:.0f} deg off)")

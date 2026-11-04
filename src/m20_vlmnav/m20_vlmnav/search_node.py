@@ -51,7 +51,7 @@ from . import frontiers as fr
 from . import progress
 from .episode import terminal_action
 from .instruction import MOVES, OBJECT, classify
-from .targets import phrase_from, same_class
+from .targets import same_class
 from .value_map import PROMPT, ValueMap, depth_row_from_image
 
 STATUS = {"done": "done", "not_found": "not_found", "timeout": "error", "canceled": "canceled", "mode": "vetoed",
@@ -223,10 +223,7 @@ class SearchNode(Node):
 
     @staticmethod
     def _wait(fut, timeout):
-        t = time.monotonic()
-        while not fut.done() and time.monotonic() - t < timeout:
-            time.sleep(0.02)
-        return fut.done()
+        return behaviors.wait(fut, timeout)
 
     # ---------- driving ----------
     def send_goto(self, label, x, y, yaw):
@@ -487,11 +484,22 @@ class SearchNode(Node):
                 mgh = self.send_goto(f"{target} approach", *ap)
                 if mgh is None:
                     log["end"] = "crash"; return
+                trail = []                                     # a new goal: its own progress window
                 while self.goto_state() == "running":
                     if gh.is_cancel_requested or not self.mode_ok:
                         log["end"] = "canceled" if gh.is_cancel_requested else "mode"; return
-                    if time.monotonic() - log["t0"] > self.max_seconds:      # a stuck approach ends the episode too
+                    t_now = time.monotonic()
+                    if t_now - log["t0"] > self.max_seconds:
                         log["end"] = "timeout"; return
+                    with self.lock:
+                        p_now = self.pose
+                    if p_now is not None:                      # a boxed-in approach is given up like a frontier is
+                        trail.append((t_now, p_now[:2]))
+                        trail = progress.prune(trail, t_now, self.stuck_s)
+                        if progress.is_stuck(trail, t_now, p_now[:2], self.stuck_s, self.stuck_m):
+                            self.get_logger().warn(f"  no progress in {self.stuck_s:.0f} s on the approach: giving up")
+                            self.cancel_goto(); log["approach"]["stuck"] = True
+                            log["end"] = "stuck"; return
                     time.sleep(0.1)
                 log["end"] = "done" if self.goto_state() == "reached" else "not_found"
                 self._png(vm, cost, origin, res_m, [], None, pose, os.path.join(out, f"map_{n_png:03d}.png"))
@@ -509,10 +517,14 @@ class SearchNode(Node):
                 f.value = vm.read(f.xy[0], f.xy[1])
             state = self.goto_state()
             # progress watchdog (believed pose; drift is slow next to the window): stuck = the robot has stayed
-            # within stuck_m of every point of its last stuck_s, whatever goals were sent meanwhile
+            # within stuck_m of every point of its last stuck_s while one goal ran (a newly sent goal restarts the
+            # window; a reached goal is not "no progress" however short it was)
+            if log.pop("trail_reset", False):               # a goal was sent since the last tick: judge from there
+                trail = []
             trail.append((now, pose[:2]))
             trail = progress.prune(trail, now, self.stuck_s)
-            if goal_xy is not None and progress.is_stuck(trail, now, pose[:2], self.stuck_s, self.stuck_m):
+            if goal_xy is not None and state == "running" and \
+                    progress.is_stuck(trail, now, pose[:2], self.stuck_s, self.stuck_m):
                 stuck_n += 1
                 step["stuck"] = [round(goal_xy[0], 2), round(goal_xy[1], 2), stuck_n]
                 self.get_logger().warn(f"  no progress in {self.stuck_s:.0f} s (goal {goal_xy[0]:.2f}, {goal_xy[1]:.2f}): "
@@ -588,12 +600,15 @@ class SearchNode(Node):
                 self._png(vm, cost, origin, res_m, fs, goal_xy, pose, os.path.join(out, f"map_{n_png:03d}.png")); n_png += 1
 
     def _go(self, f, pose, log):
-        """Send a frontier as the mission goal. -> its xy, or None if the mission server did not accept it."""
+        """Send a frontier as the mission goal. -> its xy, or None if the mission server did not accept it.
+        A sent goal restarts the progress window (log["trail_reset"], consumed by the loop): a run of short goals,
+        each reached, is progress even when they all lie within stuck_m of each other."""
         yaw = math.atan2(f.xy[1] - pose[1], f.xy[0] - pose[0])
         if self.send_goto(f"frontier {f.xy[0]:.1f},{f.xy[1]:.1f}", f.xy[0], f.xy[1], yaw) is None:
             self.get_logger().warn(f"  frontier goal ({f.xy[0]:.2f}, {f.xy[1]:.2f}) not accepted by the mission server")
             return None
         log["frontier_goals"] += 1
+        log["trail_reset"] = True
         self.get_logger().info(f"  frontier goal ({f.xy[0]:.2f}, {f.xy[1]:.2f}) value {f.value:.3f}, {f.length_m} m long")
         return f.xy
 

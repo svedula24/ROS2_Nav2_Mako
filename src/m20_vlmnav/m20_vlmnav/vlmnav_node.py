@@ -30,7 +30,7 @@ import urllib.request
 import numpy as np
 import rclpy
 from PIL import Image as PILImage
-from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -143,13 +143,6 @@ class VLMNavNode(Node):
         def on_active(bgh):
             self.active = bgh
         return behaviors.execute_move(self, self.behaviors, move, self.speed, should_stop, on_active)
-
-    @staticmethod
-    def _wait(fut, timeout):
-        t = time.monotonic()
-        while not fut.done() and time.monotonic() - t < timeout:
-            time.sleep(0.02)
-        return fut.done()
 
     # ---------- the episode ----------
     def execute(self, gh):

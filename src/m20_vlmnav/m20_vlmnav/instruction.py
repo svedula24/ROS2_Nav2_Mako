@@ -8,10 +8,12 @@
     unknown   neither: a route ("go down the corridor and stop at the first desk on your left"), a question, noise
               -> not_understood, nothing moves (a search for a sentence that names no object wandered 104 m)
 The move grammar is moves.py's plus the operator's spellings: "turn around" (180 degrees), "walk/go/drive N metres"
-without "forward", chunks joined by "then" / "and" / ",", a trailing "stop" that only closes the sentence.
+without "forward", chunks joined by "then" / "and" / ",", a trailing "stop" that only closes the sentence. A typed
+distance above moves.MAX_DIST_M (3 m) is split into legs of at most 3 m (7 m -> 3, 3, 1), up to MAX_TYPED_DIST_M.
 Known refusals of this first cut (unknown, nothing moves): an object phrase that contains a motion word or a digit
-("stop sign", "the chair on the right", "monitor 2"), questions, and "stop" on its own: stopping a RUNNING search is
-the action's cancel (tools/dev/m20 search stop), not an instruction.
+("stop sign", "the chair on the right", "monitor 2"), questions (a wh-word, or is/can/do + a pronoun, or a "?"),
+a "stop" with a condition ("stop at the door": not judgeable by dead reckoning), and "stop" on its own: stopping a
+RUNNING search is the action's cancel (tools/dev/m20 search stop), not an instruction.
 """
 import math
 import re
@@ -26,7 +28,11 @@ _SPLIT = re.compile(r"\s*(?:,|\bthen\b|\band\b|;)\s*")
 _AROUND = re.compile(r"^\s*turn\s+(?:a)?round\s*$")
 _WALK = re.compile(r"^\s*(?:walk|go|drive|move|advance)\s+(?:forward\s+|ahead\s+|straight\s+)?(?:by\s+)?"
                    r"(\d+(?:\.\d+)?)\s*(cm|centimet(?:er|re)s?|m|met(?:er|re)s?)\b\s*$")
-_QUESTION = re.compile(r"^\s*(what|where|when|who|which|how|why|is|are|do|does|did|can|could|would|should)\b|\?\s*$")
+_QUESTION = re.compile(r"^\s*(?:what|where|when|who|which|how|why)\b|"
+                       r"^\s*(?:is|are|do|does|did|can|could|would|should)\s+(?:you|i|we|it|there|this|that|the|a|an|he|she|they)\b|"
+                       r"\?\s*$")
+_STOP = re.compile(r"^\s*stop(?:\s+(?:here|now))?\s*\.?\s*$")
+MAX_TYPED_DIST_M = 30.0           # a typed distance above this is refused (nothing moves), not silently shortened
 _MOTION_WORDS = re.compile(r"\b(turn|move|forward|backward|back|ahead|straight|left|right|degrees?|met(?:er|re)s?|cm|"
                            r"corridor|hallway|walk|drive|go|stop|then)\b|\d")
 
@@ -38,20 +44,42 @@ class Instruction:
     phrase: Optional[str] = None
 
 
-def _move(chunk: str) -> Optional[moves.Move]:
-    """One chunk -> a move, or None. "stop" alone -> a STOP move (dropped by the caller when it only ends the text)."""
+def _legs(metres: float) -> List[moves.Move]:
+    """A typed distance as forward moves of at most MAX_DIST_M each: "walk 7 meters" -> 3 m, 3 m, 1 m. (The clamp
+    in moves.py guards against VLM nonsense; a typed 7 m means 7 m, so it is split, not shortened.)"""
+    out = []
+    while metres > 1e-9:
+        leg = min(metres, moves.MAX_DIST_M)
+        out.append(moves.Move(moves.FORWARD, leg))
+        metres -= leg
+    return out
+
+
+def _move(chunk: str) -> Optional[List[moves.Move]]:
+    """One chunk -> its moves (one, or several legs for a long distance), or None. A bare "stop" -> [STOP] (dropped
+    by the caller: it only ends the text). "stop at the door" / "stop next to it" is a CONDITION the robot can't
+    judge by dead reckoning -> None, so the whole instruction is refused rather than the earlier moves run blind."""
     c = chunk.strip().lower()
     if not c:
         return None
+    if _STOP.match(c):
+        return [moves.Move(moves.STOP)]
     if _AROUND.match(c):
-        return moves.Move(moves.TURN_LEFT, math.pi)
+        return [moves.Move(moves.TURN_LEFT, math.pi)]
     m = _WALK.match(c)
     if m:
         v = float(m.group(1)); metres = v / 100.0 if m.group(2).startswith("c") else v
-        if metres <= 0:
+        if metres <= 0 or metres > MAX_TYPED_DIST_M:
             return None
-        return moves.Move(moves.FORWARD, min(metres, moves.MAX_DIST_M), metres > moves.MAX_DIST_M)
-    return moves.parse(c)
+        return _legs(metres)
+    mv = moves.parse(c)
+    if mv is None or mv.kind == moves.STOP:                 # a "stop" with other words around it
+        return None
+    if mv.kind == moves.FORWARD and mv.clamped:               # "move forward 5 m": the typed number, in legs
+        m2 = re.search(r"(\d+(?:\.\d+)?)\s*(cm|centimet(?:er|re)s?|m|met(?:er|re)s?)\b", c)
+        v = float(m2.group(1)); metres = v / 100.0 if m2.group(2).startswith("c") else v
+        return None if metres > MAX_TYPED_DIST_M else _legs(metres)
+    return [mv]
 
 
 def classify(text: str) -> Instruction:
@@ -59,7 +87,7 @@ def classify(text: str) -> Instruction:
     if chunks:
         parsed = [_move(c) for c in chunks]
         if all(p is not None for p in parsed):
-            seq = [p for p in parsed if p.kind != moves.STOP]
+            seq = [m for p in parsed for m in p if m.kind != moves.STOP]
             if seq:                                                # "stop" alone is not a journey
                 return Instruction(MOVES, seq=seq)
     phrase = phrase_from(text)

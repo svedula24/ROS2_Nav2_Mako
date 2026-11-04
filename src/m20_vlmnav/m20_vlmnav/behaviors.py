@@ -45,6 +45,7 @@ def make_clients(node, callback_group) -> dict:
 
 
 def wait(fut, timeout: float) -> bool:
+    """Poll a future for up to `timeout` s. The one copy: both nodes' _wait call it."""
     t = time.monotonic()
     while not fut.done() and time.monotonic() - t < timeout:
         time.sleep(0.02)
@@ -87,8 +88,8 @@ def execute_move(node, clients: dict, move: moves.Move, speed: float,
     if bgh is None or not bgh.accepted:
         return False, "behavior rejected the goal"
     on_active(bgh)
+    res = bgh.get_result_async()
     try:
-        res = bgh.get_result_async()
         t0 = time.monotonic()
         while not res.done():
             why = should_stop()
@@ -101,5 +102,14 @@ def execute_move(node, clients: dict, move: moves.Move, speed: float,
             time.sleep(0.05)
         status = res.result().status
         return status == 4, "ok" if status == 4 else f"behavior status {status} (aborted: blocked or timed out)"
+    except BaseException:
+        # an exception inside the wait (should_stop() crashing, a shutdown): the behavior is cancelled HERE, before
+        # the handle is forgotten in `finally`; the caller's crash path would otherwise find nothing to cancel
+        if not res.done():
+            try:
+                cancel_behavior(node, bgh, res, "crash")
+            except Exception:
+                pass
+        raise
     finally:
         on_active(None)

@@ -14,9 +14,11 @@ def same_class(cls: str, target: str) -> bool:
 
 import re
 
-_LEAD = re.compile(r"^(?:please\s+)?(?:go|navigate|walk|drive|head|get)\s+(?:over\s+)?to\s+(?:the|a|an)\s+|"
-                   r"^(?:please\s+)?(?:find|locate|look\s+for|search\s+for)\s+(?:the|a|an)\s+", re.I)
-_TRAIL = re.compile(r"(?:\s*,?\s*(?:and\s+)?(?:then\s+)?stop(?:\s+(?:in\s+front\s+of|next\s+to|near|by)\s+it)?)\s*\.?$|"
+_LEAD = re.compile(r"^(?:please\s+)?(?:go|navigate|walk|drive|head|get)\s+(?:over\s+)?to\s+(?:(?:the|a|an)\s+)?|"
+                   r"^(?:please\s+)?(?:find|locate|look\s+for|search\s+for)\s+(?:(?:the|a|an)\s+)?", re.I)
+# a trailing "stop" closes the sentence only after a separator ("and stop", ", then stop"): "bus stop" keeps its word
+_TRAIL = re.compile(r"(?:\s*,\s*(?:and\s+)?(?:then\s+)?|\s+(?:and\s+(?:then\s+)?|then\s+))stop"
+                    r"(?:\s+(?:in\s+front\s+of|next\s+to|near|by)\s+it)?\s*\.?$|"
                     r"(?:\s*,?\s*please)\s*\.?$", re.I)
 
 

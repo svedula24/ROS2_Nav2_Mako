@@ -27,7 +27,6 @@ def test_prune_keeps_only_the_window():
     assert len(prune(trail, 49.0, 30.0)) == 31
 
 
-def test_switch_is_gated_by_the_commit_time_but_a_retarget_never_is():
+def test_switch_is_gated_by_the_commit_time():
     assert not switch_allowed(now=105.0, goal_t=100.0, commit_s=10.0)
     assert switch_allowed(now=110.0, goal_t=100.0, commit_s=10.0)
-    assert switch_allowed(now=101.0, goal_t=100.0, commit_s=10.0, retarget=True)

@@ -179,5 +179,9 @@ def test_phrase_from_pulls_the_object_out_of_an_instruction_and_leaves_routes_wh
     assert phrase_from("refrigerator") == "refrigerator"
     assert phrase_from("turn left 90 degrees") == "turn left 90 degrees"
     assert phrase_from("move forward 2 meters, then stop") == "move forward 2 meters"
+    assert phrase_from("go to the bus stop") == "bus stop"                    # no separator: "stop" is the noun's
+    assert phrase_from("go to the bus stop and stop") == "bus stop"
+    assert phrase_from("find ladder") == "ladder"
+    assert phrase_from("go to refrigerator, then stop") == "refrigerator"
     assert phrase_from("go straight down the corridor and stop next to the first desk on your left") == \
         "go straight down the corridor and stop next to the first desk on your left"
