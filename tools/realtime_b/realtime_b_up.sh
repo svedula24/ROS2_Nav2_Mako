@@ -26,6 +26,16 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$MODE" in vlm|search|replay) ;; *) echo "unknown --mode $MODE (vlm | search | replay)"; exit 2 ;; esac
+# RTB_SIM=gazebo: Gazebo Harmonic (tools/gazebo) instead of the Godot sim; GZ_WORLD picks tools/gazebo/worlds/<name>.sdf.
+SIM="${RTB_SIM:-godot}"; GZ_WORLD="${GZ_WORLD:-indoor_rooms}"
+case "$SIM" in godot|gazebo) ;; *) echo "unknown RTB_SIM $SIM (godot | gazebo)"; exit 2 ;; esac
+if [ "$SIM" = gazebo ]; then
+  SCENE="gazebo_${GZ_WORLD}.xml"; SITE="$GZ_WORLD"
+  # exploration map = the world's floor + margin (indoor_rooms: 16 x 12 m centred on the origin)
+  RTB_EXPLORE_ORIGIN="${RTB_EXPLORE_ORIGIN:--8.5 -6.5}"; RTB_EXPLORE_SIZE="${RTB_EXPLORE_SIZE:-17 13}"
+  # explored = what the depth camera saw (VLFM), not what the 360 deg lidar cleared through doorways (tools/gazebo/README.md)
+  export M20_EXPLORE_CLEAR="${M20_EXPLORE_CLEAR:-camera}"
+fi
 SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 
 api_up() { python3 -c 'import socket,sys
@@ -38,7 +48,14 @@ cleanup() {
   [ -n "${WATCHDOG_PID:-}" ] && { kill "$WATCHDOG_PID" 2>/dev/null || true; }
   bash "$REPO/tools/nav/kill_stack.sh" >/dev/null 2>&1 || true
   docker rm -f m20_vlm m20_vlmnav m20_itm m20_vlfm m20_detector >/dev/null 2>&1 || true
-  [ "$STOP_SIM" = "1" ] && { python3 -c 'import socket; socket.create_connection(("127.0.0.1",7799),timeout=2).sendall(b"{\"cmd\":\"quit\"}\n")' 2>/dev/null || true; }
+  if [ "$SIM" = gazebo ]; then
+    # stop first (SIGTERM): the glue zeroes the robot's velocity on its way out; rm -f alone is a SIGKILL
+    docker stop -t 3 m20_gazebo_bridge >/dev/null 2>&1 || true
+    docker rm -f m20_gazebo_bridge >/dev/null 2>&1 || true
+    [ "$STOP_SIM" = "1" ] && { docker rm -f m20_gazebo >/dev/null 2>&1 || true; }
+  else
+    [ "$STOP_SIM" = "1" ] && { python3 -c 'import socket; socket.create_connection(("127.0.0.1",7799),timeout=2).sendall(b"{\"cmd\":\"quit\"}\n")' 2>/dev/null || true; }
+  fi
   echo "[realtime_b] down."
   exit "$rc"
 }
@@ -47,8 +64,14 @@ trap 'exit 130' INT TERM
 bash "$REPO/tools/nav/kill_stack.sh" >/dev/null 2>&1 || true
 docker rm -f m20_ollama >/dev/null 2>&1 || true      # free the GPU for the VLM (the offline launcher restarts it)
 
+# 1+2 (Gazebo): the sim + ros_gz bridge + the glue (velocity from collision_monitor, drifting odometry), robot at the spawn
+if [ "$SIM" = gazebo ]; then
+  echo "[realtime_b] starting Gazebo ($GZ_WORLD) + the Gazebo ROS glue (odometry: ${RTB_ODOM:-drift}, velocity in: /cmd_vel_safe)"
+  GZ_CMD_TOPIC=/cmd_vel_safe GZ_ODOM="${RTB_ODOM:-drift}" GZ_DEPTH_OBSTACLES=1 GZ_VMAX="${GODOT_VMAX:-0.5}" \
+    bash "$REPO/tools/gazebo/gazebo_sim_up.sh" --sim-only --world "$GZ_WORLD" --odom "${RTB_ODOM:-drift}" | grep -v "^\[gazebo_sim_up\] --sim-only"
+fi
 # 1. the Godot sim (reused if already up), window parked off-screen (rendering continues)
-if api_up; then
+if [ "$SIM" = gazebo ]; then :; elif api_up; then
   echo "[realtime_b] reusing the Godot sim already on 127.0.0.1:7799"
 else
   [ -f "$GODOT_EXE" ] || { echo "ERROR: Godot not found at $GODOT_EXE (set GODOT_EXE)"; exit 1; }
@@ -59,9 +82,10 @@ else
   api_up || { echo "ERROR: the sim's API never came up"; exit 1; }
   sleep 5
 fi
-[ "${GODOT_SHOW:-0}" = "1" ] || powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$REPO/tools/godot/godot_window.ps1")" park 2>&1 | tr -d '\r' || true
+[ "$SIM" = gazebo ] || [ "${GODOT_SHOW:-0}" = "1" ] || powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$REPO/tools/godot/godot_window.ps1")" park 2>&1 | tr -d '\r' || true
 
 # 2. the bridge: drifting odometry (no map to correct it, as on an unseen site); velocity from collision_monitor
+if [ "$SIM" = godot ]; then
 echo "[realtime_b] starting the Godot ROS bridge (odometry: ${RTB_ODOM:-drift}, velocity in: /cmd_vel_safe)"
 docker rm -f m20_godot_bridge >/dev/null 2>&1 || true
 docker run -d --name m20_godot_bridge --network host --ipc host \
@@ -72,6 +96,7 @@ docker run -d --name m20_godot_bridge --network host --ipc host \
 sleep 6
 python3 -c 'import socket,time; s=socket.create_connection(("127.0.0.1",7799),timeout=10); s.sendall(b"{\"cmd\":\"reset\"}\n"); s.recv(4096); time.sleep(3)' \
   || echo "[realtime_b] WARNING: could not reset the sim to the spawn"
+fi
 
 # 3. the stack without maps: identity map->odom (M20_GT_LOC=1 with drifting odom), rolling costmaps, + Real-time B hooks.
 # The exploration map (fixed-extent, unknown-tracking global costmap) is the search's: the vlm and replay modes keep
@@ -156,11 +181,11 @@ WATCHDOG_PID=$!
 echo
 echo "=================================================================="
 if [ "$MODE" = "search" ]; then
-  echo " REAL-TIME B:  VLFM-style search: value map + frontiers + OWLv2, no maps given (Godot, $SITE)"
+  echo " REAL-TIME B:  VLFM-style search: value map + frontiers + OWLv2, no maps given ($SIM, $SITE)"
   echo " COMMANDS:     tools/dev/m20 search \"refrigerator\"   |   tools/dev/m20 search stop"
   echo " LOGS:         ~/m20_sim/vlfm/<stamp>/   |   docker logs -f m20_vlfm   |   docker logs -f m20_detector"
 else
-  echo " REAL-TIME B:  VLM moves + Nav2 behaviors, no maps (Godot, $SITE) [mode $MODE]"
+  echo " REAL-TIME B:  VLM moves + Nav2 behaviors, no maps ($SIM, $SITE) [mode $MODE]"
   echo " COMMANDS:     tools/dev/m20 vlm \"go to the ladder\"   |   tools/dev/m20 vlm stop"
   echo " LOGS:         ~/m20_sim/vlmnav/<stamp>/   |   docker logs -f m20_vlmnav"
 fi

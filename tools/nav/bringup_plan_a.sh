@@ -46,7 +46,7 @@ if [ "${M20_EKF_TF:-0}" = "1" ] && [ -n "${M20_STATIC_MAP:-}" ]; then
   echo "ERROR: M20_EKF_TF=1 with M20_STATIC_MAP is forbidden (mapping-pipeline tool leaking into runtime frames)"; exit 1
 fi
 C=docker-commander-1
-DOM=42
+DOM="${M20_DOMAIN:-42}"          # M20_DOMAIN: run beside another stack (gazebo_sim_up.sh GZ_ROS_DOMAIN)
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL="$HOME/m20_sim/sdk_deploy/src/M20_sdk_deploy/M20_description"
 SCENE="${M20_SCENE:-oil_gas_field.xml}"
@@ -462,7 +462,11 @@ fi
 # ~4 m of margin); another site needs its own.
 if [ "${M20_EXPLORE_MAP:-0}" = "1" ]; then
   echo "[4.8/7] exploration map: global costmap non-rolling, all-unknown at start, origin ${M20_EXPLORE_ORIGIN:--12 -16} size ${M20_EXPLORE_SIZE:-28 36} m"
-  docker exec -i -e ORIGIN="${M20_EXPLORE_ORIGIN:--12 -16}" -e SIZE="${M20_EXPLORE_SIZE:-28 36}" $C python3 - <<'PYEOF'
+  # M20_EXPLORE_CLEAR=camera (unset = unchanged: both layers clear): only the depth camera raytraces unknown space
+  # away, the lidar only MARKS. VLFM's "explored" area is what the depth camera saw; a 360 deg lidar that clears
+  # through every doorway declares rooms explored that the camera never looked into (Gazebo indoor_rooms, 2026-10-26:
+  # 5.6 % unknown left and no frontier while the target room was unvisited -> "not_found").
+  docker exec -i -e ORIGIN="${M20_EXPLORE_ORIGIN:--12 -16}" -e SIZE="${M20_EXPLORE_SIZE:-28 36}" -e CLEAR="${M20_EXPLORE_CLEAR:-}" $C python3 - <<'PYEOF'
 import os, yaml
 p = "/cfg/nav2_params.yaml"
 cfg = yaml.safe_load(open(p))
@@ -474,8 +478,12 @@ g["resolution"] = 0.1
 g["track_unknown_space"] = True
 g["unknown_cost_value"] = 255
 g["plugins"] = [pl for pl in g["plugins"] if pl != "static_layer"]
+note = ""
+if os.environ.get("CLEAR") == "camera":
+    g["obstacle_layer"]["scan"]["clearing"] = False
+    note = "; lidar marks only, the camera clears"
 yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print(f"  patched: global costmap {w:.0f}x{h:.0f} m at ({ox}, {oy}), 0.1 m cells, unknown tracked, no static layer")
+print(f"  patched: global costmap {w:.0f}x{h:.0f} m at ({ox}, {oy}), 0.1 m cells, unknown tracked, no static layer{note}")
 PYEOF
 fi
 
