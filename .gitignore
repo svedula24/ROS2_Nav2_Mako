@@ -239,3 +239,4 @@ tools/ci/out/run_*/
 # never committed: working notes, editor workspace files
 notes/
 *.code-workspace
+.claude/
