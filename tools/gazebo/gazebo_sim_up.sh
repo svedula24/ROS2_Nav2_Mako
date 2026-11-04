@@ -38,6 +38,9 @@ if [ "$SIM_ONLY" != 1 ]; then
   echo "[gazebo_sim_up] tearing down the previous stack (tools/nav/kill_stack.sh)"
   bash "$REPO/tools/nav/kill_stack.sh" 2>&1 | tail -2
 fi
+# SIGTERM the glue first (3 s): on exit it publishes zero velocity, so a robot mid-move stops instead of
+# coasting on its last /cmd_vel. With --sim-only kill_stack.sh above is skipped, so this is the only stop.
+docker stop -t 3 m20_gazebo_bridge >/dev/null 2>&1 || true
 docker rm -f m20_gazebo m20_gazebo_bridge >/dev/null 2>&1 || true
 
 # 1. Gazebo: server (physics + sensors) and the ros_gz parameter bridge in one container
@@ -58,6 +61,7 @@ echo "[gazebo_sim_up] Gazebo up: $(docker exec m20_gazebo bash -lc 'gz topic -l 
 
 # 2. the glue: /gz/* -> the stack's topics and frames (m20_sim image: has m20_msgs)
 echo "[gazebo_sim_up] starting the Gazebo ROS glue (odom=$ODOM)"
+docker stop -t 3 m20_gazebo_bridge >/dev/null 2>&1 || true   # same reason as above: zero velocity before removal
 docker rm -f m20_gazebo_bridge >/dev/null 2>&1 || true
 docker run -d --name m20_gazebo_bridge --network host --ipc host $ROS_ENV \
   -e GZ_ODOM="$ODOM" -e GZ_VMAX="${GZ_VMAX:-0.5}" -e GZ_DEPTH_OBSTACLES="${GZ_DEPTH_OBSTACLES:-1}" \
