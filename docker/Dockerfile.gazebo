@@ -1,0 +1,26 @@
+# Gazebo Harmonic (gz-sim 8) + ros_gz for ROS 2 Humble: the standard simulator for the M20 stack (gazebo-sim branch).
+# Runs in WSL2 next to the autonomy containers (host network, same ROS_DOMAIN_ID). Rendering: GPU via WSLg's
+# Mesa d3d12 (mount /usr/lib/wsl, /mnt/wslg, /tmp/.X11-unix) or software (LIBGL_ALWAYS_SOFTWARE=1) as a fallback.
+#   docker build -f docker/Dockerfile.gazebo -t m20_gazebo:latest docker
+FROM ros:humble-ros-base
+
+SHELL ["/bin/bash", "-c"]
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg lsb-release ca-certificates \
+    && curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] \
+       http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+       > /etc/apt/sources.list.d/gazebo-stable.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       gz-harmonic ros-humble-ros-gzharmonic ros-humble-rmw-cyclonedds-cpp \
+       ros-humble-xacro ros-humble-tf2-ros ros-humble-robot-state-publisher \
+       mesa-utils libgl1-mesa-dri libegl1 libegl-mesa0 libglx-mesa0 libvulkan1 \
+       python3-numpy \
+    && rm -rf /var/lib/apt/lists/*
+
+# WSLg GPU path: the host's /usr/lib/wsl/lib (libd3d12, libdxcore) is bind-mounted at run time; Mesa's d3d12 driver
+# finds it through the loader path below.
+ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:${LD_LIBRARY_PATH}
+ENV GZ_VERSION=harmonic
+WORKDIR /sim
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["source /opt/ros/humble/setup.bash && gz sim --version"]
