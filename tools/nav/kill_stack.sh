@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tear down the full sim stack: Nav2 + slam_toolbox + bridge + logger + estimator
-# (in the commander container) and the MuJoCo sim container. Leaves the commander
-# container up. WAITS until everything is actually dead — a fire-and-forget kill
+# (in the commander container), the MuJoCo sim container and the Godot / Gazebo
+# glue containers. Leaves the commander container (and the Gazebo sim m20_gazebo,
+# like the Godot window) up. WAITS until everything is actually dead — a fire-and-forget kill
 # let dying Nav2 nodes collide with the next bringup (duplicate action servers →
 # zombie bt_navigator answered a goal with SUCCEEDED while the robot sat parked).
 # SIGINT first so DDS participants unregister from the discovery server cleanly.
@@ -18,5 +19,6 @@ docker exec $C bash -c "
     sleep 2
   done
   echo \"remaining stack procs: \$(ps -eo args | grep -E '$PAT' | grep -v grep | wc -l)\""
-docker rm -f m20_sim_run m20_splat_cam m20_splat_view m20_mujoco_mirror m20_detector m20_godot_bridge m20_nlnav m20_semmap_rec m20_vlm m20_vlmnav m20_itm m20_vlfm 2>/dev/null
+docker stop -t 3 m20_gazebo_bridge >/dev/null 2>&1   # SIGTERM first: the Gazebo glue zeroes the robot's velocity on exit
+docker rm -f m20_sim_run m20_splat_cam m20_splat_view m20_mujoco_mirror m20_detector m20_godot_bridge m20_gazebo_bridge m20_nlnav m20_semmap_rec m20_vlm m20_vlmnav m20_itm m20_vlfm 2>/dev/null
 echo "sim container removed; stack down."

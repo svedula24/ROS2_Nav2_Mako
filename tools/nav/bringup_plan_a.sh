@@ -46,7 +46,7 @@ if [ "${M20_EKF_TF:-0}" = "1" ] && [ -n "${M20_STATIC_MAP:-}" ]; then
   echo "ERROR: M20_EKF_TF=1 with M20_STATIC_MAP is forbidden (mapping-pipeline tool leaking into runtime frames)"; exit 1
 fi
 C=docker-commander-1
-DOM=42
+DOM="${M20_DOMAIN:-42}"          # M20_DOMAIN: run beside another stack (gazebo_sim_up.sh GZ_ROS_DOMAIN)
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL="$HOME/m20_sim/sdk_deploy/src/M20_sdk_deploy/M20_description"
 SCENE="${M20_SCENE:-oil_gas_field.xml}"

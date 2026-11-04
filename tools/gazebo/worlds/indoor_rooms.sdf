@@ -1,7 +1,8 @@
 <?xml version="1.0" ?>
 <!-- Indoor test site for the M20 stack on Gazebo Harmonic: a 16 x 12 m floor, an outer wall, two inner walls with
      doorways (three rooms), and a few box obstacles with distinct colours. Origin = the robot spawn in room A.
-     Props (fridge, ladder, cone, trash can...) are added by tools/gazebo/props.py once the stack runs here. -->
+     Props the detector can name (fridge, ladder, cone, trash can, desk, chair, extinguisher) are Gazebo Fuel models
+     included below; the host cache ~/m20_sim/gz_fuel keeps them after the first download. -->
 <sdf version="1.9">
   <world name="indoor_rooms">
     <physics name="1ms" type="ode"><max_step_size>0.004</max_step_size><real_time_factor>1.0</real_time_factor></physics>

@@ -252,13 +252,19 @@ class SearchNode(Node):
         return "reached" if r.result.success else "failed"
 
     def cancel_goto(self):
+        """Cancel the mission goal in flight and WAIT (up to 3 s) for its result to land. -> True when it ended (or
+        nothing was running). The wait matters: a NavigateToPose sent while the previous one is still being aborted
+        trips Nav2's BT action client ("unknown goal response, ignoring" -> "invalid status value" -> the new goal
+        fails at once; an approach ended "not_found" 0.6 s after the detection on Gazebo, 2026-10-26)."""
+        ended = True
         if self.active is not None:
             try:
                 self.active.cancel_goal_async()
-                self._wait(self._result, 3.0)
+                ended = self._wait(self._result, 3.0)
             except Exception:
                 pass
             self.active = None
+        return ended
 
     # ---------- the search ----------
     def execute(self, gh):
@@ -469,14 +475,10 @@ class SearchNode(Node):
                                     "itm": round(log.get("last_score", -1.0), 4)}      # the view's cosine, for calibration
                 if req.dry_run:
                     log["steps"].append(step); log["end"] = "done"; return
-                self.cancel_spin(); self.cancel_goto()
-                # Let the cancel land before the approach goal: a NavigateToPose sent while the previous one is still
-                # being aborted trips Nav2's BT action client ("unknown goal response, ignoring" -> "invalid status
-                # value" -> the new goal fails at once; the approach ended "not_found" 0.6 s after the detection on
-                # Gazebo, 2026-10-26).
-                t_cancel = time.monotonic()
-                while self.goto_state() == "running" and time.monotonic() - t_cancel < 3.0:
-                    time.sleep(0.1)
+                self.cancel_spin()
+                if not self.cancel_goto():
+                    self.get_logger().warn("  the frontier goal did not end within 3 s of its cancel: the approach "
+                                           "goal may trip Nav2's BT action client (invalid status value)")
                 cm = self.costmap()
                 grid = grid_from_costmap(cm[0].shape[1], cm[0].shape[0], cm[1], cm[2], cm[0].flatten().tolist()) if cm else None
                 size = o.get("size") or [0.8, 0.8]

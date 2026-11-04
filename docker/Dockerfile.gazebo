@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg lsb-
 
 # WSLg GPU path: the host's /usr/lib/wsl/lib (libd3d12, libdxcore) is bind-mounted at run time; Mesa's d3d12 driver
 # finds it through the loader path below.
-ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 ENV GZ_VERSION=harmonic
 WORKDIR /sim
 ENTRYPOINT ["/bin/bash", "-lc"]

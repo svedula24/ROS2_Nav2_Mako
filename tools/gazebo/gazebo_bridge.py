@@ -13,12 +13,15 @@ Consumed: /cmd_vel (GZ_CMD_TOPIC; Real-time B uses /cmd_vel_safe) -> /gz/cmd_vel
   zero when disarmed or stale, capped at GZ_VMAX / GZ_WMAX. Gazebo's VelocityControl is exact: no yaw trim.
 Env: GZ_ODOM (truth|drift), GZ_ODOM_SEED, GZ_ODOM_SPEED_NOISE, GZ_ODOM_GYRO_BIAS, GZ_ODOM_SCALE, GZ_VMAX (0.5),
   GZ_WMAX (1.5), GZ_CLOUD_ZBAND (-0.45,0.70), GZ_DEPTH_OBSTACLES (1), GZ_CMD_TOPIC (/cmd_vel),
-  GZ_CAM_MOUNT (0.37646,0,0.03738), GZ_LIDAR_MOUNTS (front/rear xyz), GZ_BASE_Z (0.43: model origin -> base_link).
+  GZ_CAM_MOUNT (0.37646,0,0.03738), GZ_LIDAR_MOUNTS ("fx,fy,fz;rx,ry,rz"), GZ_BASE_Z (0.43: model origin ->
+  base_link); the three must match models/m20/model.sdf. On exit (Ctrl-C, SIGTERM, a crash) a zero Twist is sent:
+  Gazebo's VelocityControl would hold the last command for ever.
 """
 import array
 import collections
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -46,7 +49,10 @@ ZBAND = tuple(float(v) for v in os.environ.get("GZ_CLOUD_ZBAND", "-0.45,0.70").s
 DEPTH_OBSTACLES = os.environ.get("GZ_DEPTH_OBSTACLES", "1") == "1"
 CMD_TOPIC = os.environ.get("GZ_CMD_TOPIC", "/cmd_vel")
 CAM_MOUNT = tuple(float(v) for v in os.environ.get("GZ_CAM_MOUNT", "0.37646,0,0.03738").split(","))
-LIDAR_MOUNTS = {"front": (0.32028, 0.0, -0.013), "rear": (-0.32028, 0.0, -0.013)}
+# The mounts and BASE_Z must match tools/gazebo/models/m20/model.sdf (lidar poses, the base_link pose); the env
+# vars exist for a different model, not to tune these: GZ_LIDAR_MOUNTS="fx,fy,fz;rx,ry,rz".
+_LM = os.environ.get("GZ_LIDAR_MOUNTS", "0.32028,0,-0.013;-0.32028,0,-0.013").split(";")
+LIDAR_MOUNTS = {"front": tuple(float(v) for v in _LM[0].split(",")), "rear": tuple(float(v) for v in _LM[1].split(","))}
 BASE_Z = float(os.environ.get("GZ_BASE_Z", 0.43))
 CMD_STALE_S = 0.5
 RESEED_JUMP_M = 0.3
@@ -85,6 +91,15 @@ def cloud_xyz(m: PointCloud2) -> np.ndarray:
 def image_np(m: Image, dtype, channels):
     a = np.frombuffer(bytes(m.data), dtype=dtype)
     return a.reshape(m.height, m.width, channels) if channels > 1 else a.reshape(m.height, m.width)
+
+
+def rgb_from(m: Image) -> np.ndarray:
+    """An 8-bit colour frame of 3 or 4 channels (rgb8, bgr8, rgba8, bgra8) as an (h, w, 3) RGB array."""
+    channels = len(m.data) // (m.height * m.width)
+    if m.encoding not in ("rgb8", "bgr8", "rgba8", "bgra8") or channels not in (3, 4):
+        raise ValueError(f"unsupported colour encoding {m.encoding!r} with {channels} channels")
+    a = image_np(m, np.uint8, channels)[:, :, :3]
+    return a[:, :, ::-1] if m.encoding.startswith("bgr") else a
 
 
 class GazeboBridge(Node):
@@ -256,11 +271,10 @@ class GazeboBridge(Node):
         pts = cloud_xyz(m) + np.asarray(LIDAR_MOUNTS[name], np.float32)
         with self.lock:
             self.latest_lidar[name] = pts[(pts[:, 2] > ZBAND[0]) & (pts[:, 2] < ZBAND[1])]
-            if len(self.latest_lidar) < 2 and name == "front":
+            if name != "front" or len(self.latest_lidar) < 2:
                 return                                   # wait for the rear once, then publish on every front sweep
             merged = np.concatenate(list(self.latest_lidar.values()))
-        if name == "front":
-            self.cloud_pub.publish(cloud_msg(merged, "base_link", self.sensor_stamp()))
+        self.cloud_pub.publish(cloud_msg(merged, "base_link", self.sensor_stamp()))
 
     # ---------------------------------------------------------------- camera
     def on_info(self, m: CameraInfo):
@@ -287,7 +301,10 @@ class GazeboBridge(Node):
                 return
             k = both[-1]
             c, d = self.frames["c"].pop(k), self.frames["d"].pop(k)
-        self.publish_camera(c, d)
+        try:
+            self.publish_camera(c, d)
+        except Exception as e:                           # one bad frame must not take the glue (and the robot) down
+            self.get_logger().warn(f"camera frame dropped: {type(e).__name__}: {e}", throttle_duration_sec=5.0)
 
     def publish_camera(self, c: Image, d: Image):
         if self.K is None:
@@ -296,7 +313,7 @@ class GazeboBridge(Node):
         img = Image()
         img.header.stamp, img.header.frame_id = stamp, "camera_optical_link"
         img.height, img.width, img.encoding, img.step = c.height, c.width, "rgb8", c.width * 3
-        img.data = c.data if c.encoding == "rgb8" else u8(image_np(c, np.uint8, 3)[:, :, :3])
+        img.data = c.data if c.encoding == "rgb8" else u8(rgb_from(c))
         depth = image_np(d, np.float32, 1).copy()
         depth[~np.isfinite(depth)] = 0.0                 # Godot contract: 0 = no return
         dm = Image()
@@ -332,12 +349,25 @@ class GazeboBridge(Node):
 def main():
     rclpy.init()
     node = GazeboBridge()
+    # docker stop sends SIGTERM: turn it into the same clean exit as Ctrl-C, so the zero below is sent. (docker rm -f
+    # is SIGKILL: nothing runs after it, so the launchers stop the glue before removing it.)
+    def _term(*_a):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        # Gazebo's VelocityControl holds the last Twist for ever: a glue that dies mid-move must leave a zero behind
+        # (three times, 50 ms apart, in case the first is lost on a shutting-down transport)
+        try:
+            for _ in range(3):
+                node.gz_cmd_pub.publish(Twist()); time.sleep(0.05)
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

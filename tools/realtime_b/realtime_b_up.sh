@@ -49,6 +49,8 @@ cleanup() {
   bash "$REPO/tools/nav/kill_stack.sh" >/dev/null 2>&1 || true
   docker rm -f m20_vlm m20_vlmnav m20_itm m20_vlfm m20_detector >/dev/null 2>&1 || true
   if [ "$SIM" = gazebo ]; then
+    # stop first (SIGTERM): the glue zeroes the robot's velocity on its way out; rm -f alone is a SIGKILL
+    docker stop -t 3 m20_gazebo_bridge >/dev/null 2>&1 || true
     docker rm -f m20_gazebo_bridge >/dev/null 2>&1 || true
     [ "$STOP_SIM" = "1" ] && { docker rm -f m20_gazebo >/dev/null 2>&1 || true; }
   else

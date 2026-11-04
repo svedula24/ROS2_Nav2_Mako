@@ -73,10 +73,14 @@ fi
 # 3. the usual stack minus the MuJoCo pieces; no site map yet, so ground-truth localization by default
 case "$LOC" in gt) GT_LOC=1 ;; *) GT_LOC=0 ;; esac
 echo "[gazebo_sim_up] bringup: localization $LOC (odometry $ODOM)"
-M20_EXTERNAL_SIM=1 M20_SCENE="gazebo_$WORLD.xml" M20_GT_LOC=$GT_LOC M20_LOC=$LOC \
+M20_EXTERNAL_SIM=1 M20_SCENE="gazebo_$WORLD.xml" M20_GT_LOC=$GT_LOC M20_LOC=$LOC M20_DOMAIN="${GZ_ROS_DOMAIN:-42}" \
 M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 M20_SITE_MAP="${M20_SITE_MAP:-}" M20_MAX_VEL="${GZ_VMAX:-0.5}" \
 bash "$REPO/tools/nav/bringup_plan_a.sh"
-SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
-arm() { docker exec docker-commander-1 bash -lc "$SRC; ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: gazebo_sim_up}'" | grep -c "accepted=True" || true; }
-if [ "$(arm 2)" = "0" ]; then arm 0 >/dev/null; arm 2 >/dev/null; fi
+SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=${GZ_ROS_DOMAIN:-42} RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+arm() { docker exec docker-commander-1 bash -lc "$SRC; timeout 15 ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: gazebo_sim_up}'" | grep -c "accepted=True" || true; }
+ARMED=$(arm 2)
+if [ "$ARMED" != "1" ]; then arm 0 >/dev/null; sleep 1; ARMED=$(arm 2); fi
+if [ "$ARMED" != "1" ]; then
+  echo "[gazebo_sim_up] ERROR: the commander refused ASSISTED (check /m20/failsafe; docker logs docker-commander-1)"; exit 1
+fi
 echo "[gazebo_sim_up] armed ASSISTED. World $WORLD, Gazebo in m20_gazebo (logs: docker exec m20_gazebo cat /tmp/gz.log)"
