@@ -2,8 +2,9 @@
 # ============================================================================
 # m20 — operator CLI for the mission server (usability layer over RunMission).
 #
-#   tools/dev/m20 goto X Y                  one goal, via the mission server
-#   tools/dev/m20 mission "X,Y" "X,Y" ...   ordered patrol of waypoints
+#   tools/dev/m20 goto X Y [YAW]            one goal, via the mission server
+#   tools/dev/m20 mission "X,Y[,YAW]" ...   ordered patrol of waypoints (no yaw = face the next waypoint)
+#   tools/dev/m20 mission --route r.yaml    the same from a route file (tools/missions/route.py, tools/missions/*.yaml)
 #   tools/dev/m20 say "go to the printer"   natural language (NavigateNL); --dry-run --pick ID
 #   tools/dev/m20 vlm "go to the ladder"    Real-time B: a VLM picks moves, no maps (tools/realtime_b); --dry-run | stop
 #   tools/dev/m20 search "refrigerator"   Real-time B search: VLFM-style frontiers + value map + OWLv2; --dry-run | stop
@@ -20,18 +21,38 @@ CMD="${1:-help}"; shift || true
 
 case "$CMD" in
   goto)
-    [ $# -eq 2 ] || { echo "usage: m20 goto X Y"; exit 1; }
-    exec "$0" mission "$1,$2"
+    [ $# -eq 2 ] || [ $# -eq 3 ] || { echo "usage: m20 goto X Y [YAW]"; exit 1; }
+    exec "$0" mission "$(IFS=,; echo "$*")"
     ;;
   mission)
-    [ $# -ge 1 ] || { echo "usage: m20 mission \"X,Y\" [\"X,Y\" ...]"; exit 1; }
-    WPS="$*"
+    # Waypoints: "X,Y" or "X,Y,YAW" arguments, or --route file.yaml (tools/missions/route.py format). A waypoint
+    # without a yaw FACES THE NEXT ONE (the old CLI sent every goal with yaw 0 = face east, so the robot turned to
+    # face +x at every stop). wait_s in a route becomes a TYPE_WAIT item.
+    [ $# -ge 1 ] || { echo "usage: m20 mission \"X,Y[,YAW]\" [\"X,Y[,YAW]\" ...] | m20 mission --route file.yaml"; exit 1; }
+    REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+    docker cp "$REPO/tools/missions/route.py" $C:/cfg/route.py
+    if [ "$1" = "--route" ]; then
+      [ $# -eq 2 ] && [ -f "$2" ] || { echo "usage: m20 mission --route file.yaml (file must exist)"; exit 1; }
+      docker cp "$2" $C:/cfg/route.yaml
+      WPS="--route /cfg/route.yaml"
+    else
+      WPS="$*"
+    fi
     docker exec -i $C bash -lc "$SRC; python3 - $WPS <<'PYEOF'
 import sys, math, time
+sys.path.insert(0, '/cfg')
+import route
 import rclpy
 from rclpy.action import ActionClient
 from m20_msgs.action import RunMission
 from m20_msgs.msg import MissionItem
+
+args = sys.argv[1:]
+try:
+    wps = route.load_route(args[1]) if args[0] == '--route' else [route.parse_wp_arg(a, i) for i, a in enumerate(args)]
+except ValueError as e:
+    print(f'ERROR: {e}'); sys.exit(1)
+wps = route.fill_auto_yaw(wps)
 
 rclpy.init()
 n = rclpy.create_node('m20_cli')
@@ -40,13 +61,16 @@ if not cli.wait_for_server(timeout_sec=5.0):
     print('ERROR: mission server not running'); sys.exit(1)
 
 goal = RunMission.Goal()
-for i, arg in enumerate(sys.argv[1:]):
-    x, y = (float(v) for v in arg.split(','))
-    it = MissionItem(); it.type = MissionItem.TYPE_GOTO; it.label = f'wp_{i}'
+for w in wps:
+    it = MissionItem(); it.type = MissionItem.TYPE_GOTO; it.label = w.label
     it.goal.header.frame_id = 'map'
-    it.goal.pose.position.x = x; it.goal.pose.position.y = y
-    it.goal.pose.orientation.w = 1.0
+    it.goal.pose.position.x = w.x; it.goal.pose.position.y = w.y
+    it.goal.pose.orientation.z, it.goal.pose.orientation.w = route.quaternion_z(w.yaw)
     goal.items.append(it)
+    print(f'  {w.label}: ({w.x:.2f}, {w.y:.2f}) yaw {math.degrees(w.yaw):.0f} deg', flush=True)
+    if w.wait_s > 0:
+        wt = MissionItem(); wt.type = MissionItem.TYPE_WAIT; wt.wait_seconds = float(w.wait_s); wt.label = w.label + '_wait'
+        goal.items.append(wt)
 
 def fb(msg):
     f = msg.feedback

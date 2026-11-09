@@ -1,0 +1,6 @@
+# One 2 m leg south from the spawn, down the corridor the ladder runs proved (10/10, 2026-10-14).
+# Run:  tools/dev/m20 mission --route tools/missions/circuit4_2m.yaml   (map frame, metres, radians)
+frame: map
+site: circuit4
+waypoints:
+  - {x: -2.13, y: -1.65, yaw: -1.57, label: wp_2m}      # spawn is (-2.13, 0.35) facing south (-1.58)

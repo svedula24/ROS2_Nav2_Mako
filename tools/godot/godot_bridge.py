@@ -13,7 +13,8 @@ Published (stamped on this process's wall clock, the same as TF; map = the site'
                                                    is invisible to AMCL: re-initialize it (/initialpose), as the eval does.
   /odom_true (map -> base_link_true, full 3D)      for the detector, Viser and nlnav
   /IMU_DATA, /JOINTS_DATA (drdds)                  the commander's tip-over failsafe; Viser's legs
-  /LIDAR/POINTS (PointCloud2 xyz, base_link)       both hemispherical lidars (-> /scan)
+  /LIDAR/POINTS (PointCloud2 xyz, base_link)       both hemispherical lidars (-> /scan); or, GODOT_LIDAR_SPLIT=1,
+  /rslidar_points_front|rear (rslidar_front|rear)  one cloud per unit in its own frame + static TFs (the robot's shape)
   /camera/obstacle_points (PointCloud2, base_link) the depth camera as points (GODOT_DEPTH_OBSTACLES=1): the
                                                    lidars only look UP from ~0.45 m, so low obstacles come
                                                    from the camera. Bringup gives these their own costmap
@@ -70,6 +71,11 @@ CMD_STALE_S = 0.5
 # Only points the scan converter can use (pointcloud_to_laserscan keeps -0.36..0.54 m around
 # base_link), with margin: the full sweeps are ~155k points, this is ~10x fewer.
 ZBAND = tuple(float(v) for v in os.environ.get("GODOT_CLOUD_ZBAND", "-0.45,0.70").split(","))
+# GODOT_LIDAR_SPLIT=1: the robot's shape of the lidar data instead of one merged base_link cloud: one PointCloud2 per
+# unit (/rslidar_points_front, /rslidar_points_rear) in ITS OWN frame (rslidar_front / rslidar_rear) plus the static
+# TFs base_link -> rslidar_* from the sim's mounts, exactly what rslidar_sdk + the robot launcher give Nav2. No z band
+# here: the per-lidar scan converters cut the height band in base_link (tools/nav/lidar_stage.sh).
+LIDAR_SPLIT = os.environ.get("GODOT_LIDAR_SPLIT", "0") == "1"
 ODOM_MODE = os.environ.get("GODOT_ODOM", "truth")
 CMD_TOPIC = os.environ.get("GODOT_CMD_TOPIC", "/cmd_vel")   # velocity input (Real-time B: /cmd_vel_safe)
 RESEED_JUMP_M = 0.3            # true pose moved this much more than 1 m/s could explain since the last tick = a sim reset
@@ -105,13 +111,19 @@ class GodotBridge(Node):
         for L in self.payload["lidars"]:
             m = self.payload["mounts"][L["body"]]
             self.lidars.append({"dirs": gio.lidar_dirs(L["elevations_deg"], L["cols"]), "xyz": m["xyz"],
-                                "rpy": m["rpy"], "range": L["range_m"]})
+                                "rpy": m["rpy"], "range": L["range_m"], "side": gio.lidar_side(m["xyz"])})
+        if LIDAR_SPLIT:
+            sides = [L["side"] for L in self.lidars]
+            if sorted(sides) != ["front", "rear"]:
+                raise SystemExit(f"GODOT_LIDAR_SPLIT needs one front and one rear lidar, the sim has {sides}")
 
         self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
         self.true_pub = self.create_publisher(Odometry, "/odom_true", 10)
         self.imu_pub = self.create_publisher(ImuData, "/IMU_DATA", 10)
         self.jd_pub = self.create_publisher(JointsData, "/JOINTS_DATA", 10)
         self.cloud_pub = self.create_publisher(PointCloud2, "/LIDAR/POINTS", 10)
+        self.split_pubs = {L["side"]: self.create_publisher(PointCloud2, f"/rslidar_points_{L['side']}", 10)
+                           for L in self.lidars} if LIDAR_SPLIT else {}
         self.cam_cloud_pub = self.create_publisher(PointCloud2, "/camera/obstacle_points", 5)
         self.img_pub = self.create_publisher(Image, "/camera/image_raw", 5)
         self.depth_pub = self.create_publisher(Image, "/camera/depth", 5)
@@ -166,7 +178,17 @@ class GodotBridge(Node):
         t.header.frame_id, t.child_frame_id = "base_link", "camera_optical_link"
         t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = (float(v) for v in self.cam_mount)
         t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w = -0.5, 0.5, -0.5, 0.5
-        self.static_bc.sendTransform(t)
+        tfs = [t]
+        if LIDAR_SPLIT:                        # the sim's mounts, as rslidar_sdk's users get them from the robot launcher
+            for L in self.lidars:
+                s = TransformStamped()
+                s.header.stamp, s.header.frame_id, s.child_frame_id = t.header.stamp, "base_link", f"rslidar_{L['side']}"
+                s.transform.translation.x, s.transform.translation.y, s.transform.translation.z = (float(v) for v in L["xyz"])
+                (s.transform.rotation.x, s.transform.rotation.y,
+                 s.transform.rotation.z, s.transform.rotation.w) = gio.rpy_to_quat(*(float(v) for v in L["rpy"]))
+                tfs.append(s)
+                self.get_logger().info(f"lidar {L['side']}: mount xyz {L['xyz']} rpy {L['rpy']} -> frame rslidar_{L['side']}")
+        self.static_bc.sendTransform(tfs)
 
     # ---------------------------------------------------------------- commands
     def on_mode(self, m: RobotMode):
@@ -377,11 +399,17 @@ class GodotBridge(Node):
                 if i >= len(self.lidars):
                     continue
                 L = self.lidars[i]
+                if LIDAR_SPLIT:                # the robot's shape: per unit, in the sensor frame, TF carries the mount
+                    pts = gio.lidar_points_sensor(px, hdr["rings"], hdr["cols"], L["dirs"],
+                                                  rmin=L["range"][0], rmax=L["range"][1])
+                    self.split_pubs[L["side"]].publish(cloud_msg(pts, f"rslidar_{L['side']}", self.sensor_stamp()))
+                    continue
                 pts = gio.lidar_points(px, hdr["rings"], hdr["cols"], L["dirs"], L["xyz"], L["rpy"],
                                        rmin=L["range"][0], rmax=L["range"][1])
                 self.latest_lidar[i] = pts[(pts[:, 2] > ZBAND[0]) & (pts[:, 2] < ZBAND[1])]
-            self.cloud_pub.publish(cloud_msg(np.concatenate(list(self.latest_lidar.values())), "base_link",
-                                             self.sensor_stamp()))
+            if not LIDAR_SPLIT:
+                self.cloud_pub.publish(cloud_msg(np.concatenate(list(self.latest_lidar.values())), "base_link",
+                                                 self.sensor_stamp()))
 
     def sensor_stamp(self):
         """Stamp for sensor messages: the latest pose/TF stamp (publish_camera explains why), else now."""

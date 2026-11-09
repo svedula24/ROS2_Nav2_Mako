@@ -97,6 +97,7 @@ docker cp "$REPO/src/m20_navigation/config/pointcloud_to_laserscan.yaml"        
 docker cp "$REPO/tools/nav/nav_logger.py"                                         $C:/cfg/nav_logger.py
 docker cp "$REPO/tools/estimator.py"                                              $C:/cfg/estimator.py
 docker cp "$REPO/src/m20_missions/m20_missions/mission_server.py"                 $C:/cfg/mission_server.py
+docker cp "$REPO/tools/nav/nav2_profile.py"                                       $C:/cfg/nav2_profile.py
 
 if [ -n "${M20_STATIC_MAP:-}" ]; then
   echo "[1.5/7] static-map mode: staging pre-built map + localization config"
@@ -105,75 +106,30 @@ if [ -n "${M20_STATIC_MAP:-}" ]; then
   docker cp "$REPO/$M20_STATIC_MAP.posegraph" $C:/cfg/maps/oil_gas_field.posegraph
   docker cp "$REPO/$M20_STATIC_MAP.data"      $C:/cfg/maps/oil_gas_field.data
   docker cp "$REPO/tools/slam/localization_params.yaml" $C:/cfg/localization_params.yaml
-  # Global costmap: rolling window -> full-field static layer from the known map.
-  # Patch the STAGED copy only — nav2_params.yaml stays single-source for master.
-  docker exec $C python3 - <<'PYEOF'
-import yaml
-p = "/cfg/nav2_params.yaml"
-cfg = yaml.safe_load(open(p))
-g = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
-g["rolling_window"] = False
-g.pop("width", None); g.pop("height", None)
-g["track_unknown_space"] = True
-g["plugins"] = ["static_layer", "obstacle_layer", "inflation_layer"]
-g["static_layer"] = {"plugin": "nav2_costmap_2d::StaticLayer",
-                     "map_subscribe_transient_local": True,
-                     "map_topic": "/map"}
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print("patched global costmap -> static layer (full known field)")
-PYEOF
+  # Global costmap: rolling window -> full-field static layer from the known map (staged copy only).
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --static-map
 fi
 
 if [ "$SCENE" != "oil_gas_field.xml" ]; then
-  # Splat/indoor scenes: faster cruise for exploration tours. STAGED copy only — the
-  # oil & gas gates keep nav2_params.yaml as-is. Measured 2026-10-05 (splat demo): 1.0-1.6
-  # m/s with 2.0 m/s^2 accel TIPPED the M20 — flooring it out of a tight spot while still
-  # turning makes the skid-steer fishtail (uncommanded -1.2 rad/s yaw, body lifts, rolls).
-  # Keep the ORIGINAL accel (1.0) and a modest cruise; DWB still turns in place.
-  # Goal tolerance back to the live-SLAM value 0.45 (nav2_params.yaml history note:
-  # 0.20 assumes known-map localization; live SLAM jitters -> arrive-never-declare).
-  # Footprint: the real M20 rectangle (0.86 x 0.56 m incl. wheels) instead of the 0.45 m
-  # circle — its corners reach 0.51 m, so the circle let them scrape boxes at speed.
-  VMAX="${M20_MAX_VEL:-0.7}"; AMAX="${M20_MAX_ACC:-1.0}"
-  echo "[1.6/7] ${SCENE%.xml}: cruise ${VMAX} m/s, accel ${AMAX} / decel 1.5, M20 footprint, keep-away inflation 1.0 m, goal tol 0.45 m (staged params only)"
-  # -i is REQUIRED: without it docker exec drops stdin and `python3 -` runs an empty script
-  docker exec -i -e VMAX="$VMAX" -e AMAX="$AMAX" $C python3 - <<'PYEOF'
-import os, yaml
-p = "/cfg/nav2_params.yaml"
-v = float(os.environ["VMAX"])
-cfg = yaml.safe_load(open(p))
-c = cfg["controller_server"]["ros__parameters"]
-f = c["FollowPath"]
-f["max_vel_x"] = f["max_speed_xy"] = v
-acc = float(os.environ["AMAX"])
-f["acc_lim_x"], f["decel_lim_x"] = acc, -1.5
-f["xy_goal_tolerance"] = c["goal_checker"]["xy_goal_tolerance"] = 0.45
-s = cfg["velocity_smoother"]["ros__parameters"]
-s["max_velocity"][0] = v
-s["max_accel"][0], s["max_decel"][0] = acc, -1.5
-fp = "[[0.43, 0.28], [0.43, -0.28], [-0.43, -0.28], [-0.43, 0.28]]"
-# Keep-away (2026-10-05): the stock 0.55 m inflation decayed fast (scaling 3.0) and DWB
-# barely weighed obstacle cost (BaseObstacle 0.02) -> laps spent 10-18 % within 0.3 m of
-# boxes (closest 8 cm). Wider, slower-decaying inflation + a real obstacle weight make
-# the planner use aisle centres and the controller steer away from cost.
-for k in ("global_costmap", "local_costmap"):
-    cm = cfg[k][k]["ros__parameters"]
-    cm.pop("robot_radius", None)
-    cm["footprint"], cm["footprint_padding"] = fp, 0.10
-    cm["inflation_layer"]["inflation_radius"] = 1.0
-    cm["inflation_layer"]["cost_scaling_factor"] = 1.5
-f["BaseObstacle.scale"] = 0.15
-# Anti-dither (2026-10-05): with keep-away costs DWB's best option in tight spots was
-# "vx 0, wz +-0.04" — too small for the skid-steer to turn (bridge pivot assist starts at
-# 0.15 rad/s), so the robot sat 30-160 s until the progress checker fired. DWB rejects any
-# command below BOTH min_speed_xy and min_speed_theta: it must drive or really turn.
-f["min_speed_xy"], f["min_speed_theta"] = 0.10, 0.25
-# ...and if it still stalls, recover sooner: 40 s dated from slow 15-20 s pivots; a 180 deg
-# turn now takes ~5 s (0.7 rad/s), so 15 s still never aborts a legitimate in-place turn.
-c["progress_checker"]["movement_time_allowance"] = 15.0
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print(f"  patched: max_vel_x={v}, accel {acc}/-1.5, footprint 0.86x0.56 +0.10, inflation 1.0 (scale 1.5), BaseObstacle 0.15, goal tol 0.45")
-PYEOF
+  # Splat/indoor scenes: the vehicle profile (speeds, footprint, keep-away inflation, anti-dither minimums, goal
+  # tolerance) lives in tools/nav/nav2_profile.py with its measured reasons; the SAME file drives the real robot
+  # (m20-sim-to-real tools/robot/robot_up.sh). STAGED copy only: the oil & gas gates keep nav2_params.yaml as-is.
+  #   M20_ROBOT_SHAPE=1  the real M20's footprint (0.90 x 0.60 m) and limits (0.3 m/s, min speeds above the robot's
+  #                      dead zones, ObstacleFootprint critic): the rehearsal for the robot walk.
+  #   M20_MAX_VEL / M20_MAX_ACC  cruise and acceleration caps (sim default 0.7 / 1.0, robot shape 0.3 / 1.0).
+  if [ "${M20_ROBOT_SHAPE:-0}" = "1" ]; then
+    VMAX="${M20_MAX_VEL:-0.3}"; AMAX="${M20_MAX_ACC:-1.0}"
+    echo "[1.6/7] ${SCENE%.xml}: ROBOT SHAPE profile, cruise ${VMAX} m/s, accel ${AMAX} / decel 1.5 (staged params only)"
+    docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --profile robot_shape --max-vel "$VMAX" --max-acc "$AMAX"
+  else
+    VMAX="${M20_MAX_VEL:-0.7}"; AMAX="${M20_MAX_ACC:-1.0}"
+    echo "[1.6/7] ${SCENE%.xml}: sim profile, cruise ${VMAX} m/s, accel ${AMAX} / decel 1.5, M20 footprint, keep-away inflation 1.0 m, goal tol 0.45 m (staged params only)"
+    docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --profile sim --max-vel "$VMAX" --max-acc "$AMAX"
+  fi
+fi
+if [ "${M20_LIDAR_SPLIT:-0}" = "1" ]; then
+  # both costmaps read the two per-lidar scans instead of /scan (the stage itself starts at [2.5/7])
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --scans scan_front,scan_rear
 fi
 
 if [ "$EXTERNAL_SIM" = "1" ]; then
@@ -191,47 +147,10 @@ if [ "$EXTERNAL_SIM" = "1" ]; then
     docker exec $C bash -lc "mkdir -p /cfg/maps && rm -f /cfg/maps/site.*"
     docker cp "$REPO/$M20_SITE_MAP.pgm" $C:/cfg/maps/$(basename "$M20_SITE_MAP").pgm
     docker cp "$REPO/$M20_SITE_MAP.yaml" $C:/cfg/maps/site.yaml
-    docker exec -i $C python3 - <<'PYEOF'
-import yaml
-p = "/cfg/nav2_params.yaml"
-cfg = yaml.safe_load(open(p))
-g = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
-g["rolling_window"] = False
-g.pop("width", None); g.pop("height", None)
-g["track_unknown_space"] = True
-g["plugins"] = ["static_layer", "obstacle_layer", "inflation_layer"]
-g["static_layer"] = {"plugin": "nav2_costmap_2d::StaticLayer", "map_subscribe_transient_local": True,
-                     "map_topic": "/map"}
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print("  patched: global costmap = static site map + lidar + inflation (full site, non-rolling)")
-PYEOF
+    docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --static-map
   fi
   echo "[1.7/7] external sim: depth-camera obstacle layer in both costmaps; footprint collision critic"
-  docker exec -i $C python3 - <<'PYEOF'
-import yaml
-p = "/cfg/nav2_params.yaml"
-cfg = yaml.safe_load(open(p))
-# DWB's BaseObstacle critic scores only the robot's CENTRE cell, so a trajectory whose centre stays below
-# inscribed cost can still put a wheel into a wall: the skid-steer M20 cut a corridor corner by 6 cm,
-# rode up the wall and tipped over (mapping run, 2026-10-13). ObstacleFootprint checks the whole
-# footprint along each trajectory; same weight as BaseObstacle had.
-f = cfg["controller_server"]["ros__parameters"]["FollowPath"]
-f["critics"] = ["ObstacleFootprint" if c == "BaseObstacle" else c for c in f["critics"]]
-f["ObstacleFootprint.scale"] = f.pop("BaseObstacle.scale", 0.15)
-for k in ("global_costmap", "local_costmap"):
-    cm = cfg[k][k]["ros__parameters"]
-    if "camera_layer" not in cm["plugins"]:
-        cm["plugins"].insert(cm["plugins"].index("inflation_layer"), "camera_layer")
-    cm["camera_layer"] = {
-        "plugin": "nav2_costmap_2d::ObstacleLayer", "enabled": True, "observation_sources": "camera",
-        "camera": {"topic": "/camera/obstacle_points", "data_type": "PointCloud2",
-                   "sensor_frame": "camera_optical_link", "marking": True, "clearing": True,
-                   "min_obstacle_height": -0.36, "max_obstacle_height": 0.54,
-                   "obstacle_max_range": 4.0, "raytrace_max_range": 4.5, "raytrace_min_range": 0.0,
-                   "expected_update_rate": 0.0}}
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print("  patched: camera_layer (PointCloud2 /camera/obstacle_points) in global + local costmaps")
-PYEOF
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --camera-layer --footprint-critic
 fi
 
 # the splat camera replaces the MuJoCo camera (one /camera/image_raw publisher)
@@ -267,15 +186,25 @@ if [ "${M20_SPLAT_CAMERA:-0}" = "1" ] && [ "$EXTERNAL_SIM" != "1" ]; then
     m20_splat:latest python3 /splat_camera_node.py
 fi
 
-echo "[2.4/7] static TF base_link->lidar_link (commander-local; cross-container"
-echo "        transient_local latching proved unreliable after WSL reboots)"
-# 0.10 m z-offset = LIDAR_OFFSET in tools/mujoco_sim.py (keep in sync)
-docker exec -d $C bash -lc "$SRC; ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0.10 --frame-id base_link --child-frame-id lidar_link"
-sleep 1
+if [ "${M20_LIDAR_SPLIT:-0}" = "1" ]; then
+  # The robot's shape (external sim with GODOT_LIDAR_SPLIT=1): two per-unit clouds in their sensor frames (the bridge
+  # publishes them and their mount TFs) -> /scan_front + /scan_rear through the SAME stage script the robot uses.
+  [ "$EXTERNAL_SIM" = "1" ] || { echo "ERROR: M20_LIDAR_SPLIT=1 needs the external (Godot) sim"; exit 1; }
+  echo "[2.5/7] lidar stage, robot shape: /rslidar_points_front|rear -> /scan_front + /scan_rear (tools/nav/lidar_stage.sh)"
+  bash "$REPO/tools/nav/lidar_stage.sh" $C
+  sleep 3
+  bash "$REPO/tools/nav/lidar_stage.sh" $C --check || { echo "ERROR: the split lidar stage did not come up (is the bridge running with GODOT_LIDAR_SPLIT=1?)"; exit 1; }
+else
+  echo "[2.4/7] static TF base_link->lidar_link (commander-local; cross-container"
+  echo "        transient_local latching proved unreliable after WSL reboots)"
+  # 0.10 m z-offset = LIDAR_OFFSET in tools/mujoco_sim.py (keep in sync)
+  docker exec -d $C bash -lc "$SRC; ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0.10 --frame-id base_link --child-frame-id lidar_link"
+  sleep 1
 
-echo "[2.5/7] starting pointcloud_to_laserscan (/LIDAR/POINTS -> /scan)"
-docker exec -d $C bash -lc "$SRC; ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node --ros-args -r cloud_in:=/LIDAR/POINTS -r scan:=/scan --params-file /cfg/pointcloud_to_laserscan.yaml"
-sleep 2
+  echo "[2.5/7] starting pointcloud_to_laserscan (/LIDAR/POINTS -> /scan)"
+  docker exec -d $C bash -lc "$SRC; ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node --ros-args -r cloud_in:=/LIDAR/POINTS -r scan:=/scan --params-file /cfg/pointcloud_to_laserscan.yaml"
+  sleep 2
+fi
 
 if [ "${M20_EKF:-0}" = "1" ]; then
   echo "[2.6/7] starting GPS-fused EKF estimator (tf=${M20_EKF_TF:-0} — 1 = GPS-anchored mapping)"
@@ -376,35 +305,9 @@ elif [ "${M20_LOC:-}" = "amcl" ]; then
   [ "$EXTERNAL_SIM" = "1" ] && [ -n "${M20_SITE_MAP:-}" ] || { echo "ERROR: M20_LOC=amcl needs M20_EXTERNAL_SIM=1 and M20_SITE_MAP"; exit 1; }
   read -r SX SY SYAW <<< "${M20_START_POSE:-0 0 0}"
   echo "[4/7] AMCL localization on the site map (initial pose $SX $SY $SYAW)"
-  docker exec -i -e SX="$SX" -e SY="$SY" -e SYAW="$SYAW" $C python3 - <<'PYEOF'
-import os, yaml
-p = "/cfg/nav2_params.yaml"
-cfg = yaml.safe_load(open(p))
-cfg["amcl"] = {"ros__parameters": {
-    "use_sim_time": False,
-    "global_frame_id": "map", "odom_frame_id": "odom", "base_frame_id": "base_link",
-    "scan_topic": "scan", "map_topic": "map", "first_map_only": False,
-    # motion model: how much the particles spread per metre / radian of odometry (rot-from-rot, rot-from-trans,
-    # trans-from-trans, trans-from-rot). 0.1: the drift model is ~2 % + 0.002 rad/s; Nav2's default 0.2 left the
-    # cloud ~0.3 m / 13 deg wide on circuit4 (2026-10-14) and the estimate wandered inside it in the long corridor.
-    "robot_model_type": "nav2_amcl::DifferentialMotionModel",
-    "alpha1": 0.1, "alpha2": 0.1, "alpha3": 0.1, "alpha4": 0.1, "alpha5": 0.1,
-    # sensor model: likelihood field = per beam, how far its endpoint lands from the nearest map obstacle.
-    # sigma_hit 0.1: 96 % of scan endpoints land within 0.10 m of the site map at the true pose (measured at the spawn)
-    "laser_model_type": "likelihood_field", "max_beams": 120, "laser_min_range": 0.5, "laser_max_range": 12.0,
-    "laser_likelihood_max_dist": 2.0, "sigma_hit": 0.1, "z_hit": 0.5, "z_rand": 0.5, "z_short": 0.05, "z_max": 0.05,
-    "lambda_short": 0.1, "do_beamskip": False,
-    "min_particles": 500, "max_particles": 2000, "pf_err": 0.05, "pf_z": 0.99, "resample_interval": 1,
-    "recovery_alpha_fast": 0.0, "recovery_alpha_slow": 0.0,
-    "update_min_d": 0.1, "update_min_a": 0.1,                 # filter update every 0.1 m or 0.1 rad of motion
-    "tf_broadcast": True, "transform_tolerance": 1.0, "save_pose_rate": 0.5,
-    "set_initial_pose": True, "always_reset_initial_pose": False,
-    "initial_pose": {"x": float(os.environ["SX"]), "y": float(os.environ["SY"]), "z": 0.0,
-                     "yaw": float(os.environ["SYAW"])},
-}}
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print("  patched: amcl block (likelihood field, 500-2000 particles, initial pose from M20_START_POSE)")
-PYEOF
+  # amcl listens on one scan: /scan (merged sim lidar) or /scan_front when the lidars are split (M20_AMCL_SCAN)
+  AMCL_SCAN="${M20_AMCL_SCAN:-$([ "${M20_LIDAR_SPLIT:-0}" = "1" ] && echo scan_front || echo scan)}"
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --amcl "$SX $SY $SYAW" --amcl-scan "$AMCL_SCAN"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=/cfg/maps/site.yaml -p use_sim_time:=false >/cfg/out/map_server.log 2>&1"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_amcl amcl --ros-args --params-file /cfg/nav2_params.yaml >/cfg/out/amcl.log 2>&1"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_localization -p autostart:=true -p node_names:=\"['map_server', 'amcl']\" >/cfg/out/loc_lifecycle.log 2>&1"
@@ -437,21 +340,8 @@ sleep 6
 # loudly without it.
 if [ -n "${M20_OBSTACLE_SCALE:-}${M20_MIN_VEL_X:-}${M20_CAM_MIN_Z:-}" ]; then
   echo "[4.7/7] keep-away knobs: obstacle scale ${M20_OBSTACLE_SCALE:-unchanged}, min_vel_x ${M20_MIN_VEL_X:-unchanged}, camera min z ${M20_CAM_MIN_Z:-unchanged}"
-  docker exec -i -e OS="${M20_OBSTACLE_SCALE:-}" -e MV="${M20_MIN_VEL_X:-}" -e CZ="${M20_CAM_MIN_Z:-}" $C python3 - <<'PYEOF'
-import os, yaml
-p = "/cfg/nav2_params.yaml"
-cfg = yaml.safe_load(open(p))
-f = cfg["controller_server"]["ros__parameters"]["FollowPath"]
-if os.environ["OS"]:
-    f["ObstacleFootprint.scale"] = float(os.environ["OS"])
-if os.environ["MV"]:
-    f["min_vel_x"] = float(os.environ["MV"])
-if os.environ["CZ"]:
-    for k in ("global_costmap", "local_costmap"):
-        cfg[k][k]["ros__parameters"]["camera_layer"]["camera"]["min_obstacle_height"] = float(os.environ["CZ"])
-yaml.safe_dump(cfg, open(p, "w"), sort_keys=False)
-print("  patched:", {k: v for k, v in (("ObstacleFootprint.scale", os.environ["OS"]), ("min_vel_x", os.environ["MV"]), ("camera min z", os.environ["CZ"])) if v})
-PYEOF
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml ${M20_OBSTACLE_SCALE:+--obstacle-scale "$M20_OBSTACLE_SCALE"} \
+    ${M20_MIN_VEL_X:+--min-vel-x "$M20_MIN_VEL_X"} ${M20_CAM_MIN_Z:+--cam-min-z "$M20_CAM_MIN_Z"}
 fi
 
 # Exploration-map hook (M20_EXPLORE_MAP=1; unset = unchanged): the global costmap becomes the robot's own memory of an

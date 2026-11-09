@@ -13,7 +13,9 @@
 #                                                 odometry, like the real robot; gt = the sim's ground-truth pose;
 #                                                 odom = drifting odometry, NO correction (an eval baseline).
 #                                                 With --no-site-map the default is gt (AMCL needs the map).
-#   then:  tools/dev/m20 say "go to the ladder"
+#   bash tools/godot/godot_sim_up.sh --robot-shape --no-nl   the robot walk rehearsal: the real M20's lidar shape
+#                                                 (/scan_front + /scan_rear) and Nav2 profile, waypoints only
+#   then:  tools/dev/m20 say "go to the ladder"      or   tools/dev/m20 mission --route tools/missions/circuit4_2m.yaml
 # The local LLM (Ollama, NLNAV_LLM_MODEL, default qwen2.5:7b-instruct) runs in m20_ollama and is kept
 # running between launches (the model stays loaded); NLNAV_LLM=claude switches to the Anthropic API.
 #
@@ -28,6 +30,7 @@ SITE="${GODOT_SITE:-circuit4_cam_mesh}"
 SCENE="godot_circuit4.xml"                      # tools/sim/godot_circuit4.scene.yaml (waypoints, splat frame)
 PORT="${VIEW_PORT:-8080}"
 VISER=0; STOP_SIM=0; DETECT=0; SITE_MAP="tools/sim/godot_circuit4_map"; LOC="${M20_LOC:-}"
+ROBOT_SHAPE=0; NL=1
 OBJECT_MAP="$HOME/m20_sim/semmap/circuit4/object_map.json"
 LLM="${NLNAV_LLM:-ollama}"; LLM_MODEL="${NLNAV_LLM_MODEL:-qwen2.5:7b-instruct}"
 while [ $# -gt 0 ]; do
@@ -38,7 +41,10 @@ while [ $# -gt 0 ]; do
     --no-site-map) SITE_MAP="" ;;
     --object-map) OBJECT_MAP="$2"; shift ;;
     --loc) LOC="$2"; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --robot-shape) ROBOT_SHAPE=1 ;;     # the real M20's shape: two per-lidar clouds in their frames (/scan_front + /scan_rear),
+                                        # the robot_shape Nav2 profile (0.90 x 0.60 m, 0.3 m/s); the walk rehearsal
+    --no-nl) NL=0 ;;                    # waypoints only (tools/dev/m20 mission / goto): no LLM, no NL container
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown option $1 (see --help)"; exit 2 ;;
   esac
   shift
@@ -110,6 +116,7 @@ docker rm -f m20_godot_bridge >/dev/null 2>&1 || true
 docker run -d --name m20_godot_bridge --network host --ipc host \
   -e ROS_DOMAIN_ID=42 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp -e PYTHONUNBUFFERED=1 \
   -e GODOT_VMAX="${GODOT_VMAX:-0.5}" -e GODOT_DEPTH_OBSTACLES="${GODOT_DEPTH_OBSTACLES:-1}" -e GODOT_ODOM="$ODOM" \
+  -e GODOT_LIDAR_SPLIT="$ROBOT_SHAPE" \
   -v "$REPO/tools/godot":/godot:ro \
   m20_sim:latest bash -lc "source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; python3 /godot/godot_bridge.py" >/dev/null
 sleep 6
@@ -126,9 +133,12 @@ fi
 # 3. the usual stack, minus the MuJoCo pieces (bringup M20_EXTERNAL_SIM=1); localization per --loc
 # NL navigation runs in its own container (step 4b: it needs OWLv2's text encoder), not the commander.
 echo "[godot_sim_up] localization: $LOC (odometry: $ODOM$( [ "$LOC" = amcl ] && echo ", initial pose $START_POSE"))"
+[ "$ROBOT_SHAPE" = "1" ] && echo "[godot_sim_up] ROBOT SHAPE: split lidars -> /scan_front + /scan_rear, robot_shape Nav2 profile (${M20_MAX_VEL:-0.3} m/s)"
+# robot shape: the profile's 0.3 m/s cap (M20_MAX_VEL overrides); otherwise the bridge's GODOT_VMAX is also Nav2's cap
 M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=$GT_LOC M20_LOC=$LOC M20_START_POSE="$START_POSE" \
-M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 \
-M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="${GODOT_VMAX:-0.5}" bash "$REPO/tools/nav/bringup_plan_a.sh"
+M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 M20_ROBOT_SHAPE=$ROBOT_SHAPE M20_LIDAR_SPLIT=$ROBOT_SHAPE \
+M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="$([ "$ROBOT_SHAPE" = "1" ] && echo "${M20_MAX_VEL:-0.3}" || echo "${GODOT_VMAX:-0.5}")" \
+bash "$REPO/tools/nav/bringup_plan_a.sh"
 # the mission server (m20 say / goto) needs ASSISTED; bringup leaves TELEOP
 SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 arm() { docker exec docker-commander-1 bash -lc "$SRC; timeout 15 ros2 service call /m20/set_mode m20_msgs/srv/SetMode '{mode: $1, requester: godot_sim_up}' 2>/dev/null" | grep -c "accepted=True" || true; }
@@ -159,6 +169,10 @@ PY
 echo "[godot_sim_up] armed ASSISTED (verified on /m20/mode)"
 
 # 4a. local LLM for the structured query (kept running across launches: the model stays loaded)
+if [ "$NL" = "0" ]; then
+  echo "[godot_sim_up] --no-nl: no LLM / NL container; drive with tools/dev/m20 mission --route tools/missions/<route>.yaml"
+  LLM=none
+fi
 if [ "$LLM" = "ollama" ]; then
   if ! docker ps --format '{{.Names}}' | grep -q '^m20_ollama$'; then
     echo "[godot_sim_up] starting the local LLM (Ollama, $LLM_MODEL)"
@@ -173,11 +187,13 @@ if [ "$LLM" = "ollama" ]; then
 fi
 
 # 4b. NL navigation: LLM query -> object map lookup -> approach pose -> RunMission
-[ -f "$OBJECT_MAP" ] || echo "[godot_sim_up] NOTE: no object map at $OBJECT_MAP: only named places will resolve (tools/semmap/record_mapping_run.sh, then build_object_map.sh)"
-echo "[godot_sim_up] starting NL navigation (llm=$LLM, model=$LLM_MODEL)"
-# tools/godot/nlnav_up.sh owns the container start (tools/nlnav_eval/eval.sh restarts it with another model)
-bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "$SCENE" --llm "$LLM" --model "$LLM_MODEL" \
-  --min-label-score "${MIN_LABEL_SCORE:-0.4}" --pose-source "$POSE_SOURCE" >/dev/null
+if [ "$NL" = "1" ]; then
+  [ -f "$OBJECT_MAP" ] || echo "[godot_sim_up] NOTE: no object map at $OBJECT_MAP: only named places will resolve (tools/semmap/record_mapping_run.sh, then build_object_map.sh)"
+  echo "[godot_sim_up] starting NL navigation (llm=$LLM, model=$LLM_MODEL)"
+  # tools/godot/nlnav_up.sh owns the container start (tools/nlnav_eval/eval.sh restarts it with another model)
+  bash "$REPO/tools/godot/nlnav_up.sh" --object-map "$OBJECT_MAP" --scene "$SCENE" --llm "$LLM" --model "$LLM_MODEL" \
+    --min-label-score "${MIN_LABEL_SCORE:-0.4}" --pose-source "$POSE_SOURCE" >/dev/null
+fi
 
 # 4b'. Nav2 robot-pose watchdog: relaunches nav2 if a costmap's published footprint stops updating (the
 # silent frozen-pose failure of 2026-10-13; see the script's header). Log + backtraces in ~/m20_sim/watchdog

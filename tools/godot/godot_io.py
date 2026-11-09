@@ -160,15 +160,33 @@ def lidar_dirs(elevations_deg, cols: int) -> np.ndarray:
     return np.stack([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el) * np.ones_like(az)], -1)
 
 
+def rpy_to_quat(r, p, y):
+    """(x, y, z, w) of the ZYX Euler rotation, same convention as rpy_to_mat and tf2's static_transform_publisher."""
+    cr, sr, cp, sp, cy, sy = math.cos(r / 2), math.sin(r / 2), math.cos(p / 2), math.sin(p / 2), math.cos(y / 2), math.sin(y / 2)
+    return (sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy)
+
+
+def lidar_points_sensor(payload: bytes, rings: int, cols: int, dirs: np.ndarray, rmin=0.1, rmax=60.0) -> np.ndarray:
+    """One sweep's range image -> float32 (N, 3) points in the SENSOR frame (what a real lidar driver publishes:
+    rslidar_sdk's /rslidar_points_* are in rslidar_front / rslidar_rear, and TF carries the mount)."""
+    r = mm24(payload, rings, cols).astype(np.float32) * 1e-3
+    ok = (r >= rmin) & (r <= rmax)
+    return (dirs[ok] * r[ok][:, None]).astype(np.float32)
+
+
 def lidar_points(payload: bytes, rings: int, cols: int, dirs: np.ndarray, mount_xyz, mount_rpy=(0, 0, 0),
                  rmin=0.1, rmax=60.0) -> np.ndarray:
     """One sweep's range image -> float32 (N, 3) points in base_link (sensor pose = URDF mount)."""
-    r = mm24(payload, rings, cols).astype(np.float32) * 1e-3
-    ok = (r >= rmin) & (r <= rmax)
-    p = dirs[ok] * r[ok][:, None]
+    p = lidar_points_sensor(payload, rings, cols, dirs, rmin, rmax)
     if any(mount_rpy):
         p = p @ rpy_to_mat(*mount_rpy).T
     return (p + np.asarray(mount_xyz, float)).astype(np.float32)
+
+
+def lidar_side(mount_xyz) -> str:
+    """Which RoboSense unit a mount is: the one ahead of base_link's origin is "front", the other "rear"."""
+    return "front" if float(mount_xyz[0]) >= 0 else "rear"
 
 
 def depth_points(depth: np.ndarray, fx, fy, cx, cy, mount_xyz, stride=8, rmax=6.0) -> np.ndarray:

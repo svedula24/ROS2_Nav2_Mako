@@ -1,0 +1,9 @@
+# Three legs along the proven corridor (x = -2.13, y 0.35 .. -8.5): 4.35 m south, 4.3 m south, 8.65 m back north
+# = 17.3 m straight-line, with a 180 deg turn at the far end. Headings: wp_1 auto (faces wp_2), the rest given.
+# Run:  tools/dev/m20 mission --route tools/missions/circuit4_loop.yaml
+frame: map
+site: circuit4
+waypoints:
+  - [-2.13, -4.0]                                        # yaw auto: faces the next waypoint (south)
+  - {x: -2.13, y: -8.3, yaw: 1.57, label: wp_far, wait_s: 2}   # arrive, turn to face north, pause 2 s
+  - {x: -2.13, y: 0.35, yaw: -1.58, label: wp_home}     # back at the spawn, facing south again
