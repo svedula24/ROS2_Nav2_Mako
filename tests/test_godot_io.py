@@ -61,6 +61,23 @@ def test_lidar_beam_geometry():
     assert any(np.allclose(p, [0.32 + math.cos(math.radians(30)), 0, 0.487], atol=1e-5) for p in pts)
 
 
+def test_lidar_sensor_frame_points_and_mount_quaternion():
+    """GODOT_LIDAR_SPLIT: the sensor-frame cloud plus the mount TF must equal the old base_link cloud."""
+    el = [0.0, 30.0]
+    dirs = g.lidar_dirs(el, 4)
+    mm = np.zeros((2, 4)); mm[0, 0] = 1500; mm[1, 2] = 2000
+    sensor = g.lidar_points_sensor(mm_rgba(mm), 2, 4, dirs)
+    assert len(sensor) == 2 and any(np.allclose(p, [1.5, 0, 0], atol=1e-5) for p in sensor)
+    xyz, rpy = (0.32028, 0.0, -0.013), (0.0, -1.57079, -3.14159)                # the robot's front mount
+    base = g.lidar_points(mm_rgba(mm), 2, 4, dirs, xyz, rpy)
+    q = g.rpy_to_quat(*rpy)
+    R = g.quat_to_mat(*q)
+    assert np.allclose(sensor @ R.T + np.array(xyz), base, atol=1e-5)          # TF(q, xyz) applied = base_link points
+    assert np.allclose(g.quat_to_rpy(*q), rpy, atol=1e-6)
+    assert np.allclose(g.rpy_to_quat(0, 0, math.pi / 2), [0, 0, math.sqrt(0.5), math.sqrt(0.5)])
+    assert g.lidar_side((0.32, 0, -0.013)) == "front" and g.lidar_side((-0.32, 0, -0.013)) == "rear"
+
+
 def test_depth_points_land_in_front_of_the_camera():
     d = np.zeros((480, 640), np.float32)
     d[240, 320] = 3.0                                            # centre pixel, 3 m
