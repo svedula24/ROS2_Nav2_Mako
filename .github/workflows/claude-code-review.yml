@@ -39,7 +39,14 @@ jobs:
           show_full_output: true   # the review's transcript in the run log; without it a silent run cannot be diagnosed
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # The review also applies the Lean rules in CLAUDE.md ("What a review should flag first"): the ponytail
+          # review folded into this one (2026-11-09), so one review covers correctness, motion safety and bloat.
+          prompt: |
+            /code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            Then apply the Lean rules from CLAUDE.md ("What a review should flag first") to the same diff: dead code,
+            unused options, a helper the repo already has, stdlib doing the job, an abstraction or flag with one user,
+            near-copies, a function mixing jobs. Report each lean finding as an inline comment with a concrete case
+            and the smallest fix (prefer deletion), and end the summary with a verdict and the lines that could go.
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options

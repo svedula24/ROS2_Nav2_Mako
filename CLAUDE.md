@@ -36,6 +36,13 @@ Autonomy stack for the M20 robot: ROS 2 Humble, Nav2, a commander with failsafes
   made for as a test.
 - Duplication across the Godot, Gazebo and demo tools: the shared helpers live in `tools/godot/godot_io.py`
   and `src/m20_vlmnav/m20_vlmnav/behaviors.py`; a second copy is a finding.
+- Lean (the ponytail review rules, 2026-11-09): after correctness and safety, every extra line is a cost. Flag
+  code that should not exist or should be smaller: dead code and unused options; a helper the repo already has
+  (name its path); stdlib or platform doing the job of new code or a new dependency; an abstraction, flag or
+  config with one user or none; near-copies that must change together; a function mixing unrelated jobs. A
+  `shortcut:` comment naming its ceiling and upgrade path is a decision, not a finding. Every finding needs a
+  concrete failing case and the smallest fix, preferring deletion; no style taste, no "consider". Finish with
+  a verdict (ship, or which findings first) and the lines that could go.
 
 ## Conventions
 

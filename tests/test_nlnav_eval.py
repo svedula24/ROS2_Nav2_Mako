@@ -114,3 +114,24 @@ def test_judge_realtime_b_facing_and_heading():
     assert judge(turn, dict(base, final_xy=[-2.4, 0.4], final_yaw=math.radians(6)))[0]
     ok, why = judge(turn, dict(base, final_xy=[-2.4, 0.4], final_yaw=math.radians(-90)))
     assert not ok and "heading" in why
+
+
+def test_judge_waypoint_walk_legs_scan_and_map_odom_step():
+    e = {"status": "done", "leg_tol_m": 0.45, "min_scan_m": 0.35, "max_map_odom_step_m": 0.05,
+         "max_loc_err_m": {"vendor": 0.10, "amcl": 0.35}}
+    legs = [{"label": "wp_0", "goal": [0, -4], "end": [0.1, -4.2], "err_m": 0.22, "t_s": 14.0},
+            {"label": "wp_far", "goal": [0, -8.3], "end": [0, -8.0], "err_m": 0.30, "t_s": 16.0}]
+    ok = {"status": "done", "items": [], "legs": legs, "min_scan_m": 0.62, "map_odom_step_max_m": 0.012,
+          "loc_err_max_m": 0.08, "loc_yaw_err_max_deg": 2.0, "max_tilt_rad": 0.05, "max_footprint_age_s": 0.2}
+    passed, why = judge(e, ok, {}, "vendor")
+    assert passed and "legs 0.22 m/14 s, 0.30 m/16 s" in why and "closest obstacle 0.62 m" in why
+    far = dict(ok, legs=[dict(legs[0], err_m=0.7), legs[1]])
+    assert not judge(e, far, {}, "vendor")[0] and "wp_0 0.70 m" in judge(e, far, {}, "vendor")[1]
+    assert not judge(e, dict(ok, min_scan_m=0.2), {}, "vendor")[0]                # grazed an obstacle
+    assert not judge(e, dict(ok, map_odom_step_max_m=0.2), {}, "vendor")[0]       # the stuttering correction
+    assert judge(e, dict(ok, loc_err_max_m=0.3), {}, "amcl")[0]                    # 0.3 m is fine for AMCL...
+    assert not judge(e, dict(ok, loc_err_max_m=0.3), {}, "vendor")[0]              # ...not for the robot's own pose
+    assert judge(e, dict(ok, map_odom_step_max_m=None), {}, "gt")[0]              # gt: the step is not judged
+    cancel = {"status": "canceled", "cancel_after_s": 6, "max_rollout_m": 0.5}
+    assert judge(cancel, {"status": "canceled", "items": [], "legs": [], "stop_drift_m": 0.3, "settle_m": 0.0}, {}, "vendor")[0]
+    assert not judge(cancel, {"status": "canceled", "items": [], "legs": [], "stop_drift_m": 0.9, "settle_m": 0.0}, {}, "vendor")[0]

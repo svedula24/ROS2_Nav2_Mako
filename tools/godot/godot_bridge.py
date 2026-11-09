@@ -242,7 +242,7 @@ class GodotBridge(Node):
         self.gyro_z = float(gyro[2])
         accel = imu.get("accel", [0.0, 0.0, 9.81])
 
-        ox, oy, oyaw = self._odom_pose(px, py, yaw, float(v_body[0]))
+        ox, oy, oyaw = self._odom_pose(px, py, yaw, float(v_body[0]), float(v_body[1]))
         od = Odometry()
         od.header.stamp, od.header.frame_id, od.child_frame_id = now, "odom", "base_link"
         od.pose.pose.position.x, od.pose.pose.position.y = float(ox), float(oy)
@@ -282,7 +282,7 @@ class GodotBridge(Node):
                 e.position, e.velocity, e.torque = float(j["q"]), float(j["dq"]), float(j["tau"])
             self.jd_pub.publish(jd)
 
-    def _odom_pose(self, px, py, yaw, v_forward):
+    def _odom_pose(self, px, py, yaw, v_forward, v_lateral=0.0):
         """The pose /odom and TF odom->base_link carry: truth, or (GODOT_ODOM=drift) dead reckoning."""
         if self.drift is None:
             return px, py, yaw
@@ -296,7 +296,7 @@ class GodotBridge(Node):
                                    + (" after a sim reset" if jumped else ""))
             pose = self.drift.pose
         else:
-            pose = self.drift.step(v_forward, yaw, now - self._last_odom_t)
+            pose = self.drift.step(v_forward, yaw, now - self._last_odom_t, v_lateral)
         self._last_true_xy, self._last_odom_t = (px, py), now
         return pose
 

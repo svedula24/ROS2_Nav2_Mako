@@ -11,7 +11,10 @@
 #   bash tools/godot/godot_sim_up.sh --stop-sim   also quit the Godot sim on exit
 #   bash tools/godot/godot_sim_up.sh --loc gt     localization: default amcl = AMCL on the site map from DRIFTING
 #                                                 odometry, like the real robot; gt = the sim's ground-truth pose;
-#                                                 odom = drifting odometry, NO correction (an eval baseline).
+#                                                 odom = drifting odometry, NO correction (an eval baseline);
+#                                                 vendor = the robot's own 2 Hz map pose (faked from the sim's
+#                                                 truth, 0.1 s late, 1 cm noise) turned into map->odom by
+#                                                 tools/nav/map_tf_adapter.py, the way the real bridge does it.
 #                                                 With --no-site-map the default is gt (AMCL needs the map).
 #   bash tools/godot/godot_sim_up.sh --robot-shape --no-nl   the robot walk rehearsal: the real M20's lidar shape
 #                                                 (/scan_front + /scan_rear) and Nav2 profile, waypoints only
@@ -49,14 +52,20 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# robot shape: the site map at the robot's own map resolution (0.1 m, like NOS's occ_grid.pgm), built by
+# site_map.py --res 0.1 from the same mesh; the 0.05 m map stays the default for the NL work
+[ "$ROBOT_SHAPE" = "1" ] && [ "$SITE_MAP" = "tools/sim/godot_circuit4_map" ] && SITE_MAP="tools/sim/godot_circuit4_map_0p1"
+# AMCL's sigma_hit follows the map's cell size (nav2_profile.apply_amcl): 0.2 on a 0.1 m map, else 0.1
+MAP_RES=$( [ -n "$SITE_MAP" ] && sed -n 's/^resolution: *//p' "$REPO/$SITE_MAP.yaml" || echo 0.05 )
+AMCL_SIGMA_HIT=$( [ "$MAP_RES" = "0.1" ] && echo 0.2 || echo 0.1 )
 # default: AMCL (since 2026-10-15), unless there is no site map to localize against
 [ -n "$LOC" ] || { if [ -n "$SITE_MAP" ]; then LOC=amcl; else LOC=gt; fi; }
 case "$LOC" in
   gt) ODOM=truth; GT_LOC=1; POSE_SOURCE=odom_true ;;
   odom) ODOM=drift; GT_LOC=1; POSE_SOURCE=tf ;;   # baseline: drifting odometry, map->odom fixed at identity
-  amcl) ODOM=drift; GT_LOC=0; POSE_SOURCE=tf
-        [ -n "$SITE_MAP" ] || { echo "ERROR: --loc amcl needs the site map (drop --no-site-map)"; exit 2; } ;;
-  *) echo "unknown --loc $LOC (gt | amcl | odom)"; exit 2 ;;
+  amcl|vendor) ODOM=drift; GT_LOC=0; POSE_SOURCE=tf    # vendor = the robot's own 2 Hz map pose (faked from truth) -> map->odom
+        [ -n "$SITE_MAP" ] || { echo "ERROR: --loc $LOC needs the site map (drop --no-site-map)"; exit 2; } ;;
+  *) echo "unknown --loc $LOC (gt | amcl | vendor | odom)"; exit 2 ;;
 esac
 # the spawn = the scene's "start" waypoint: AMCL's initial pose
 START_POSE=$(sed -n 's/^ *start: *\[\(.*\)\].*/\1/p' "$REPO/tools/sim/${SCENE%.xml}.scene.yaml" | tr -d ' ' | tr ',' ' ')
@@ -87,6 +96,12 @@ cleanup() {
   exit 0
 }
 trap cleanup INT TERM EXIT
+# A previous launcher instance left running (its heartbeat loop sees the NEW bridge under the same name and never
+# exits) keeps its Nav2 pose watchdog, which relaunched Nav2 beside this stack's: two bt_navigators, every goal
+# "unknown goal response" / aborted (2026-11-09, the AMCL restart). Kill them before anything else; -9 skips their
+# cleanup traps, which would run kill_stack.sh into this bringup.
+for p in $(pgrep -f 'tools/godot/godot_sim_up.sh'); do [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null; done
+pkill -f 'tools/nav/nav2_pose_watchdog.sh' 2>/dev/null || true
 bash "$REPO/tools/nav/kill_stack.sh" >/dev/null 2>&1 || true
 
 # 1. the Godot sim (Windows), windowed: headless renders no camera or lidar
@@ -109,6 +124,12 @@ fi
 if [ "${GODOT_SHOW:-0}" != "1" ]; then
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$REPO/tools/godot/godot_window.ps1")" park 2>&1 | tr -d '\r' || true   # not fatal, but errors stay visible
 fi
+
+# bringup runs inside docker-commander-1; after godot_sim_down.sh --all it no longer exists (2026-11-09: bringup died
+# with "No such container" and the launcher tore down without a hint)
+docker ps --format '{{.Names}}' | grep -qx docker-commander-1 || {
+  echo "[godot_sim_up] starting the commander container (docker compose up -d commander)"
+  docker compose -f "$REPO/docker/compose.yaml" up -d commander >/dev/null; sleep 3; }
 
 # 2. the bridge: sim <-> ROS topics (replaces the MuJoCo container + locomotion bridge)
 echo "[godot_sim_up] starting the Godot ROS bridge"
@@ -137,6 +158,7 @@ echo "[godot_sim_up] localization: $LOC (odometry: $ODOM$( [ "$LOC" = amcl ] && 
 # robot shape: the profile's 0.3 m/s cap (M20_MAX_VEL overrides); otherwise the bridge's GODOT_VMAX is also Nav2's cap
 M20_EXTERNAL_SIM=1 M20_SCENE="$SCENE" M20_GT_LOC=$GT_LOC M20_LOC=$LOC M20_START_POSE="$START_POSE" \
 M20_NO_GOAL=1 M20_SPLAT_CAMERA=0 M20_NLNAV=0 M20_ROBOT_SHAPE=$ROBOT_SHAPE M20_LIDAR_SPLIT=$ROBOT_SHAPE \
+M20_AMCL_SIGMA_HIT="${M20_AMCL_SIGMA_HIT:-$AMCL_SIGMA_HIT}" \
 M20_SITE_MAP="$SITE_MAP" M20_MAX_VEL="$([ "$ROBOT_SHAPE" = "1" ] && echo "${M20_MAX_VEL:-0.3}" || echo "${GODOT_VMAX:-0.5}")" \
 bash "$REPO/tools/nav/bringup_plan_a.sh"
 # the mission server (m20 say / goto) needs ASSISTED; bringup leaves TELEOP

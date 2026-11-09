@@ -72,10 +72,10 @@ def test_camera_layer_is_sim_only_and_amcl_block(cfg):
     cm = cfg["global_costmap"]["global_costmap"]["ros__parameters"]
     assert cm["plugins"].index("camera_layer") == cm["plugins"].index("inflation_layer") - 1
     assert cm["camera_layer"]["camera"]["min_obstacle_height"] == -0.36
-    prof.apply_amcl(cfg, ("-2.13", "0.35", "-1.6"), scan_topic="scan_front")
+    prof.apply_amcl(cfg, ("-2.13", "0.35", "-1.6"), scan_topic="scan_front", sigma_hit=0.2)
     a = cfg["amcl"]["ros__parameters"]
     assert a["scan_topic"] == "scan_front" and a["initial_pose"] == {"x": -2.13, "y": 0.35, "z": 0.0, "yaw": -1.6}
-    assert a["sigma_hit"] == 0.1 and a["max_beams"] == 120
+    assert a["sigma_hit"] == 0.2 and a["max_beams"] == 120                    # 0.2 = 2x the 0.1 m map's cell size
 
 
 def test_keepaway_knobs(cfg):

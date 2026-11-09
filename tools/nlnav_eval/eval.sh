@@ -36,7 +36,9 @@ TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_DIR/${TAG}_${TS}.json"
 # odom = drifting odom, no correction; amcl = drifting odom + AMCL)
 ODOM=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' m20_godot_bridge 2>/dev/null | sed -n 's/^GODOT_ODOM=//p')
 ODOM=${ODOM:-truth}
-if docker exec $C pgrep -f nav2_amcl >/dev/null 2>&1; then LOCMODE=amcl; elif [ "$ODOM" = drift ]; then LOCMODE=odom; else LOCMODE=gt; fi
+if docker exec $C pgrep -f nav2_amcl >/dev/null 2>&1; then LOCMODE=amcl
+elif docker exec $C pgrep -f map_tf_adapter >/dev/null 2>&1; then LOCMODE=vendor     # the robot's own pose report -> map->odom
+elif [ "$ODOM" = drift ]; then LOCMODE=odom; else LOCMODE=gt; fi
 
 if [ -n "$MODEL" ]; then
   echo "[eval] switching the NL node to $MODEL"
@@ -56,6 +58,9 @@ fi
 # The search needs its matcher, its detector and its node: a missing one would read as a real not_found.
 case "$ACTION" in */vlmnav/*) MODEL_CTR=m20_vlm; NEED="m20_vlm" ;; */vlfm/*) MODEL_CTR=m20_itm; NEED="m20_itm m20_detector m20_vlfm" ;;
                   *) MODEL_CTR=m20_nlnav; NEED="m20_nlnav" ;; esac
+# waypoint walks (cases_waypoints.yaml, `kind: waypoints`): mission server only, no model container, always drive-level
+WAYPOINTS=0
+if grep -q '^kind: waypoints' "$CASES"; then WAYPOINTS=1; NEED=""; MODEL_CTR=""; ACTION=/m20/mission/run; fi
 for ctr in $NEED; do
   [ "$(docker inspect -f '{{.State.Running}}' "$ctr" 2>/dev/null)" = "true" ] \
     || { echo "ERROR: $ctr is not running (needed for --action $ACTION)"; exit 1; }
@@ -74,18 +79,21 @@ cfg = {'llm': env.get('NLNAV_LLM') or ('vlm' if vlm else 'vlfm_search' if itm el
        'git': subprocess.run(['git', '-C', '$REPO', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()}
 print(json.dumps(cfg))")
 echo "[eval] config $CFG"
-docker logs m20_nlnav 2>&1 | grep -E "objects kept|min_label" | tail -1 | sed -E 's/^\[INFO\] \[[0-9.]+\] \[m20_nlnav\]: /[eval] /' || true   # informational
+[ "$WAYPOINTS" = "1" ] || docker logs m20_nlnav 2>&1 | grep -E "objects kept|min_label" | tail -1 | sed -E 's/^\[INFO\] \[[0-9.]+\] \[m20_nlnav\]: /[eval] /' || true   # informational
 
 # the runner + judge + cases + object map go into the commander (no repo mount there)
 docker exec $C bash -lc "rm -rf /tmp/nlnav_eval && mkdir -p /tmp/nlnav_eval"
 docker cp "$REPO/tools/nlnav_eval/run_eval.py" $C:/tmp/nlnav_eval/
 docker cp "$REPO/tools/nlnav_eval/judge.py" $C:/tmp/nlnav_eval/
+docker cp "$REPO/tools/missions/route.py" $C:/tmp/nlnav_eval/
+[ "$WAYPOINTS" = "1" ] && docker cp "$REPO/tools/missions" $C:/tmp/nlnav_eval/missions
 docker cp "$CASES" $C:/tmp/nlnav_eval/cases.yaml
 [ -f "$OBJECT_MAP" ] && docker cp "$OBJECT_MAP" $C:/tmp/nlnav_eval/object_map.json
 T0=$(date +%s)
 docker exec -i $C bash -lc "$SRC; python3 /tmp/nlnav_eval/run_eval.py --cases /tmp/nlnav_eval/cases.yaml --out /tmp/nlnav_eval/run.json \
   --repeat $REPEAT --tag '$TAG' --config '$CFG' --object-map /tmp/nlnav_eval/object_map.json --action '$ACTION' $DRIVE ${ONLY:+--only $ONLY}"
 docker cp $C:/tmp/nlnav_eval/run.json "$OUT"
-docker logs --since "$T0" m20_nlnav 2>&1 | grep "timing:" > "$OUT_DIR/${TAG}_${TS}.timing.log" || true
+if [ "$WAYPOINTS" = "1" ]; then : > "$OUT_DIR/${TAG}_${TS}.timing.log"; else
+docker logs --since "$T0" m20_nlnav 2>&1 | grep "timing:" > "$OUT_DIR/${TAG}_${TS}.timing.log" || true; fi
 python3 "$REPO/tools/nlnav_eval/finish_run.py" "$OUT" "$OUT_DIR/${TAG}_${TS}.timing.log"
 echo "[eval] saved $OUT"
