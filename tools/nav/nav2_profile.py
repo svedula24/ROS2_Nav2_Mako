@@ -9,7 +9,7 @@ check compares them). Every number has a measured reason, written next to it.
   python3 nav2_profile.py /cfg/nav2_params.yaml --profile robot_shape # the real M20 shape (also the sim rehearsal)
       [--max-vel 0.3] [--max-acc 1.0]
       [--static-map] [--scans scan_front,scan_rear] [--camera-layer] [--footprint-critic]
-      [--amcl "x y yaw" --amcl-scan scan_front]
+      [--amcl "x y yaw" --amcl-scan scan_front --amcl-sigma-hit 0.2]
       [--obstacle-scale 1.0] [--min-vel-x 0] [--cam-min-z -0.30]
 Prints "profile <name> v<PROFILE_VERSION>: <what changed>" so every run log says which settings drove.
 
@@ -116,9 +116,11 @@ def apply_camera_layer(cfg, min_z=-0.36):
     return f"camera layer (min z {min_z})"
 
 
-def apply_amcl(cfg, start, scan_topic="scan"):
+def apply_amcl(cfg, start, scan_topic="scan", sigma_hit=0.1):
     """AMCL on the known map against DRIFTING odometry (no static map->odom then). Tuned 2026-10-14 on circuit4:
-    alphas 0.1 (drift ~2 % + 0.002 rad/s), sigma_hit 0.1 m (96 % of endpoints within 0.10 m of the map), 120 beams."""
+    alphas 0.1 (drift ~2 % + 0.002 rad/s), sigma_hit 0.1 m (96 % of endpoints within 0.10 m of the 0.05 m map),
+    120 beams. sigma_hit is how far a beam's endpoint may land from the nearest map wall and still count as a hit:
+    keep it about twice the map's cell size (0.1 m map -> 0.2)."""
     sx, sy, syaw = start
     cfg["amcl"] = {"ros__parameters": {
         "use_sim_time": False,
@@ -127,7 +129,7 @@ def apply_amcl(cfg, start, scan_topic="scan"):
         "robot_model_type": "nav2_amcl::DifferentialMotionModel",
         "alpha1": 0.1, "alpha2": 0.1, "alpha3": 0.1, "alpha4": 0.1, "alpha5": 0.1,
         "laser_model_type": "likelihood_field", "max_beams": 120, "laser_min_range": 0.5, "laser_max_range": 12.0,
-        "laser_likelihood_max_dist": 2.0, "sigma_hit": 0.1, "z_hit": 0.5, "z_rand": 0.5, "z_short": 0.05, "z_max": 0.05,
+        "laser_likelihood_max_dist": 2.0, "sigma_hit": float(sigma_hit), "z_hit": 0.5, "z_rand": 0.5, "z_short": 0.05, "z_max": 0.05,
         "lambda_short": 0.1, "do_beamskip": False,
         "min_particles": 500, "max_particles": 2000, "pf_err": 0.05, "pf_z": 0.99, "resample_interval": 1,
         "recovery_alpha_fast": 0.0, "recovery_alpha_slow": 0.0,
@@ -136,7 +138,7 @@ def apply_amcl(cfg, start, scan_topic="scan"):
         "set_initial_pose": True, "always_reset_initial_pose": False,
         "initial_pose": {"x": float(sx), "y": float(sy), "z": 0.0, "yaw": float(syaw)},
     }}
-    return f"amcl on /{scan_topic} from ({sx}, {sy}, {syaw})"
+    return f"amcl on /{scan_topic} from ({sx}, {sy}, {syaw}), sigma_hit {sigma_hit}"
 
 
 def apply_keepaway(cfg, obstacle_scale=None, min_vel_x=None, cam_min_z=None):
@@ -178,6 +180,7 @@ def main(argv=None):
                     help="ObstacleFootprint instead of BaseObstacle (robot_shape already has it)")
     ap.add_argument("--amcl", default=None, help='"x y yaw" initial pose')
     ap.add_argument("--amcl-scan", default="scan")
+    ap.add_argument("--amcl-sigma-hit", type=float, default=0.1, help="about 2x the map cell size")
     ap.add_argument("--obstacle-scale", type=float, default=None)
     ap.add_argument("--min-vel-x", type=float, default=None)
     ap.add_argument("--cam-min-z", type=float, default=None)
@@ -198,7 +201,7 @@ def main(argv=None):
     if a.camera_layer:
         notes.append(apply_camera_layer(cfg))
     if a.amcl:
-        notes.append(apply_amcl(cfg, a.amcl.split(), a.amcl_scan))
+        notes.append(apply_amcl(cfg, a.amcl.split(), a.amcl_scan, a.amcl_sigma_hit))
     k = apply_keepaway(cfg, a.obstacle_scale, a.min_vel_x, a.cam_min_z)
     if k:
         notes.append(k)

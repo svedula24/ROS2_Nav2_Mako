@@ -1,0 +1,28 @@
+# Waypoint-walk eval (the Nav2 rehearsal for the real M20, 2026-11-09). Every case drives a route file from
+# tools/missions through the mission server; no NL layer. Run on the robot-shape stack:
+#   bash tools/godot/godot_sim_up.sh --robot-shape --no-nl --loc vendor     (or --loc amcl)
+#   bash tools/nlnav_eval/eval.sh --cases tools/nlnav_eval/cases_waypoints.yaml --repeat 3 --tag wp_vendor
+# expect keys (judge.py): status done | canceled; leg_tol_m (every leg's TRUE end within this of its goal: Nav2
+# declares arrival on its BELIEVED pose at its 0.45 m goal tolerance, so the truth can be off by that plus the
+# localization error; 0.55 = 0.45 + the 0.10 m vendor localization bar. Measured 2026-11-09: arrivals 0.39-0.42 m
+# on a straight leg, one loop run 0.50 m with the belief 0.04 m off); min_scan_m (closest obstacle any scan saw
+# during the drive); max_map_odom_step_m (the
+# localization correction may not jump more than this between samples: the first bridge's stutter, 0.15 m per report at 0.3 m/s,
+# fails it); max_loc_err_m per localization mode (vendor = the robot's own 2 Hz pose, amcl = AMCL on the 0.1 m map);
+# cancel_after_s + max_rollout_m (cancel mid-leg: rolls out at most this far, then stays still).
+kind: waypoints
+site: circuit4
+start_pose: [-2.13, 0.35, -1.6]
+
+cases:
+  - name: wp_2m
+    route: missions/circuit4_2m.yaml
+    expect: {status: done, leg_tol_m: 0.55, min_scan_m: 0.35, max_map_odom_step_m: 0.10,
+             max_loc_err_m: {vendor: 0.10, amcl: 0.35}}
+  - name: wp_3_route
+    route: missions/circuit4_loop.yaml
+    expect: {status: done, leg_tol_m: 0.55, min_scan_m: 0.35, max_map_odom_step_m: 0.10,
+             max_loc_err_m: {vendor: 0.10, amcl: 0.35}}
+  - name: wp_cancel_midleg
+    route: missions/circuit4_loop.yaml
+    expect: {status: canceled, cancel_after_s: 6, max_rollout_m: 0.5}

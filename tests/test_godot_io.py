@@ -186,3 +186,15 @@ def test_drift_odom_follows_true_turns_across_the_pi_wrap():
     (_, _, th), true_yaw = _drive(o, 0.0, 0.5, 2.0, yaw0=3.0)  # turns through +pi
     wrap = lambda a: math.atan2(math.sin(a), math.cos(a))
     assert abs(wrap(th - true_yaw)) < 1e-9
+
+
+def test_drift_odom_integrates_lateral_speed_like_the_robot_reports_it():
+    o = g.DriftOdom(speed_noise=0.0, gyro_bias=0.0, gyro_noise=0.0)
+    o.reset(0.0, 0.0, 0.0)
+    for _ in range(50):                                          # 1 s sliding left at 0.2 m/s, heading east
+        x, y, th = o.step(0.0, 0.0, 0.02, v_lateral=0.2)
+    assert abs(x) < 1e-9 and abs(y - 0.2) < 1e-9 and th == 0.0
+    o.reset(0.0, 0.0, math.pi / 2)                               # heading north: left is -x
+    for _ in range(50):
+        x, y, th = o.step(0.0, math.pi / 2, 0.02, v_lateral=0.2)
+    assert abs(x + 0.2) < 1e-9 and abs(y) < 1e-9

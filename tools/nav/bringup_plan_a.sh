@@ -307,10 +307,24 @@ elif [ "${M20_LOC:-}" = "amcl" ]; then
   echo "[4/7] AMCL localization on the site map (initial pose $SX $SY $SYAW)"
   # amcl listens on one scan: /scan (merged sim lidar) or /scan_front when the lidars are split (M20_AMCL_SCAN)
   AMCL_SCAN="${M20_AMCL_SCAN:-$([ "${M20_LIDAR_SPLIT:-0}" = "1" ] && echo scan_front || echo scan)}"
-  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --amcl "$SX $SY $SYAW" --amcl-scan "$AMCL_SCAN"
+  # M20_AMCL_SIGMA_HIT: ~2x the map's cell size (0.1 for the 0.05 m map, 0.2 for a 0.1 m map like the robot's)
+  docker exec $C python3 /cfg/nav2_profile.py /cfg/nav2_params.yaml --amcl "$SX $SY $SYAW" --amcl-scan "$AMCL_SCAN" --amcl-sigma-hit "${M20_AMCL_SIGMA_HIT:-0.1}"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=/cfg/maps/site.yaml -p use_sim_time:=false >/cfg/out/map_server.log 2>&1"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_amcl amcl --ros-args --params-file /cfg/nav2_params.yaml >/cfg/out/amcl.log 2>&1"
   docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_localization -p autostart:=true -p node_names:=\"['map_server', 'amcl']\" >/cfg/out/loc_lifecycle.log 2>&1"
+  sleep 4
+elif [ "${M20_LOC:-}" = "vendor" ]; then
+  # The robot's own localization, rehearsed (2026-11-09): vendor_pose_sim.py fakes the M20's 2 Hz map-pose report from
+  # the sim's truth (0.1 s late, 1 cm noise); map_tf_adapter.py turns each NEW report into map->odom against the
+  # drifting odometry at the report's stamp, as the real bridge will. No AMCL, no static map->odom.
+  [ "$EXTERNAL_SIM" = "1" ] && [ -n "${M20_SITE_MAP:-}" ] || { echo "ERROR: M20_LOC=vendor needs M20_EXTERNAL_SIM=1 and M20_SITE_MAP"; exit 1; }
+  echo "[4/7] VENDOR-STYLE localization: faked 2 Hz robot pose report -> map_tf_adapter -> map->odom; map_server on the site map"
+  docker cp "$REPO/tools/nav/vendor_pose_sim.py" $C:/cfg/vendor_pose_sim.py
+  docker cp "$REPO/tools/nav/map_tf_adapter.py" $C:/cfg/map_tf_adapter.py
+  docker exec -d $C bash -lc "$SRC; python3 /cfg/vendor_pose_sim.py >/cfg/out/vendor_pose_sim.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; python3 /cfg/map_tf_adapter.py >/cfg/out/map_tf_adapter.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_map_server map_server --ros-args -p yaml_filename:=/cfg/maps/site.yaml -p use_sim_time:=false >/cfg/out/map_server.log 2>&1"
+  docker exec -d $C bash -lc "$SRC; ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_map -p autostart:=true -p node_names:=\"['map_server']\" >/cfg/out/map_lifecycle.log 2>&1"
   sleep 4
 elif [ "${M20_GT_LOC:-0}" = "1" ]; then
   # DEMO-ONLY ground-truth localization: the sim publishes odom = truth (M20_GT_ODOM),

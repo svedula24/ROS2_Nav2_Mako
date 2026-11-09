@@ -4,3 +4,5 @@ class Twist:
     def __init__(self): self.linear = _V3(); self.angular = _V3()
 class PoseStamped:
     def __init__(self): self.header = None
+class TransformStamped:
+    def __init__(self): self.header = None

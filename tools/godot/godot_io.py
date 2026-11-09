@@ -259,19 +259,24 @@ class DriftOdom:
     def reset(self, x, y, yaw):
         self.pose, self._prev_true_yaw = (float(x), float(y), float(yaw)), float(yaw)
 
-    def step(self, v_forward, true_yaw, dt):
-        """Advance by dt seconds given the body's forward speed and the TRUE yaw now. -> (x, y, yaw)."""
+    def step(self, v_forward, true_yaw, dt, v_lateral=0.0):
+        """Advance by dt seconds given the body's forward (and lateral) speed and the TRUE yaw now. -> (x, y, yaw).
+        Lateral speed counts like the real M20's reported LinearY (the bridge's dead reckoner integrates both):
+        without it the skid-steer's sideways travel in a 180 deg turn was invisible to odometry, and the believed
+        pose was 0.14-0.17 m off at the next 2 Hz correction (measured 2026-11-09, circuit4 loop)."""
         x, y, th = self.pose
         dyaw = math.atan2(math.sin(true_yaw - self._prev_true_yaw), math.cos(true_yaw - self._prev_true_yaw))
         self._prev_true_yaw = true_yaw
-        if abs(v_forward) < self.STILL_V and abs(dyaw) < self.STILL_W * max(dt, 1e-6):   # standing still
+        if math.hypot(v_forward, v_lateral) < self.STILL_V and abs(dyaw) < self.STILL_W * max(dt, 1e-6):   # standing still
             th = math.atan2(math.sin(th + dyaw), math.cos(th + dyaw))
             self.pose = (x, y, th)
             return self.pose
         th = th + dyaw + self.gyro_bias * dt + (self.rng.normal(0.0, self.gyro_noise) if self.gyro_noise else 0.0)
         th = math.atan2(math.sin(th), math.cos(th))
-        v = v_forward * self.scale * (1.0 + (self.rng.normal(0.0, self.speed_noise) if self.speed_noise else 0.0))
-        self.pose = (x + v * math.cos(th) * dt, y + v * math.sin(th) * dt, th)
+        k = self.scale * (1.0 + (self.rng.normal(0.0, self.speed_noise) if self.speed_noise else 0.0))
+        vx, vy = v_forward * k, v_lateral * k
+        c, s = math.cos(th), math.sin(th)
+        self.pose = (x + (c * vx - s * vy) * dt, y + (s * vx + c * vy) * dt, th)
         return self.pose
 
 

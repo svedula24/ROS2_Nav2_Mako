@@ -58,6 +58,31 @@ def _judge(expect, attempt, objects, localization):
             return False, f"goal {d:.2f} m from expected (tol {expect.get('tol', 0.5)})"
         why.append(f"goal within {d:.2f} m")
     # ---- drive-level ----
+    if "legs" in attempt:                                       # a waypoint walk: every leg ends near its goal
+        tol = expect.get("leg_tol_m", 0.45)
+        far = [l for l in attempt["legs"] if l["err_m"] > tol]
+        if st == "done" and far:
+            return False, "legs off: " + ", ".join(f"{l['label']} {l['err_m']:.2f} m" for l in far) + f" (tol {tol})"
+        if attempt["legs"]:
+            why.append("legs " + ", ".join(f"{l['err_m']:.2f} m/{l['t_s']:.0f} s" for l in attempt["legs"]))
+        if "min_scan_m" in expect:                              # closest the lidar saw anything: keep-away held
+            seen = attempt.get("min_scan_m")
+            if seen is None:
+                return False, "no scan samples"
+            if seen < expect["min_scan_m"]:
+                return False, f"came within {seen:.2f} m of an obstacle (limit {expect['min_scan_m']})"
+            why.append(f"closest obstacle {seen:.2f} m")
+        if "max_map_odom_step_m" in expect and localization != "gt":
+            step = attempt.get("map_odom_step_max_m")
+            if step is None:
+                return False, "no map->odom samples"
+            if step > expect["max_map_odom_step_m"]:
+                return False, f"map->odom jumped {step:.3f} m (limit {expect['max_map_odom_step_m']})"
+            why.append(f"map->odom steps <= {step:.3f} m")
+    if isinstance(expect.get("max_loc_err_m"), dict):          # a limit per localization mode (vendor vs amcl)
+        expect = dict(expect, max_loc_err_m=expect["max_loc_err_m"].get(localization, math.inf))
+    if "cancel_after_s" in expect:                              # a mid-leg cancel: a bounded roll-out, then still
+        expect = dict(expect, stop_after_s=expect["cancel_after_s"])
     if "stop_after_s" in expect:
         # "stops": a bounded roll-out after the command (pipeline latency + braking: measured 0.27 m at 0.5 m/s)
         # and no motion in the second after that. The roll-out is recorded; the limit is generous on purpose.
