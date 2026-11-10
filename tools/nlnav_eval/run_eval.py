@@ -25,7 +25,7 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PolygonStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PolygonStamped, PoseStamped, PoseWithCovarianceStamped
 from sensor_msgs.msg import LaserScan
 from m20_msgs.action import NavigateNL, RunMission
 from m20_msgs.msg import FailsafeStatus, MissionItem, RobotMode
@@ -57,7 +57,7 @@ def rpy(q):
 
 
 class Eval(Node):
-    def __init__(self, action="/m20/nlnav/navigate"):
+    def __init__(self, action="/m20/nlnav/navigate", truth_topic="/odom_true"):
         super().__init__("nlnav_eval")
         self.lock = threading.Lock()
         self.pose = None                      # (x, y, yaw, roll, pitch, t)
@@ -66,7 +66,11 @@ class Eval(Node):
         self.fp_last = {}                     # costmap -> (last stamp seen, monotonic time it last advanced)
         self.failsafe = ""
         self.watch = False
-        self.create_subscription(Odometry, "/odom_true", self.on_odom, qos_profile_sensor_data)
+        # "truth": the sim's /odom_true (Odometry), or on the robot its own position report /m20/vendor_pose
+        # (PoseStamped): the best reference we have there, so the robot's localization error reads as the adapter's
+        # lag, not as a map error
+        truth_type = PoseStamped if truth_topic == "/m20/vendor_pose" else Odometry
+        self.create_subscription(truth_type, truth_topic, self.on_odom, qos_profile_sensor_data)
         for k in ("local", "global"):         # both costmaps froze independently on 2026-10-13
             self.create_subscription(PolygonStamped, f"/{k}_costmap/published_footprint",
                                      (lambda k: lambda m: self.on_fp(k, m))(k), 10)
@@ -113,25 +117,26 @@ class Eval(Node):
         self.initial_pose.publish(m)
 
     def on_odom(self, m):
-        r, p, y = rpy(m.pose.pose.orientation)
+        pose = getattr(m.pose, "pose", m.pose)                # Odometry.pose.pose or PoseStamped.pose
+        r, p, y = rpy(pose.orientation)
         with self.lock:
-            self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, y, r, p, time.time())
+            self.pose = (pose.position.x, pose.position.y, y, r, p, time.time())
             if self.watch:
                 self.max_tilt = max(self.max_tilt, abs(r), abs(p))
-                xy = (m.pose.pose.position.x, m.pose.pose.position.y)
+                xy = (pose.position.x, pose.position.y)
                 if self._path_last is not None:
                     self.path_m += math.hypot(xy[0] - self._path_last[0], xy[1] - self._path_last[1])
                 self._path_last = xy
         if self.watch:
-            self._sample_localization(m, y)
+            self._sample_localization(m, pose, y)
 
-    def _sample_localization(self, m, true_yaw):
+    def _sample_localization(self, m, pose, true_yaw):
         try:
             t = self.tf.lookup_transform("map", "base_link", Time.from_msg(m.header.stamp))
         except Exception:
             return                                            # TF not at that stamp yet: skip this sample
-        dx = t.transform.translation.x - m.pose.pose.position.x
-        dy = t.transform.translation.y - m.pose.pose.position.y
+        dx = t.transform.translation.x - pose.position.x
+        dy = t.transform.translation.y - pose.position.y
         dyaw = rpy(t.transform.rotation)[2] - true_yaw
         dyaw = math.degrees(math.atan2(math.sin(dyaw), math.cos(dyaw)))   # wrap to [-180, 180]
         with self.lock:
@@ -142,8 +147,8 @@ class Eval(Node):
             o = self.tf.lookup_transform("odom", "base_link", Time.from_msg(m.header.stamp))
         except Exception:
             return
-        e = math.hypot(o.transform.translation.x - m.pose.pose.position.x,
-                       o.transform.translation.y - m.pose.pose.position.y)
+        e = math.hypot(o.transform.translation.x - pose.position.x,
+                       o.transform.translation.y - pose.position.y)
         mo = (t.transform.translation.x - o.transform.translation.x, t.transform.translation.y - o.transform.translation.y)
         with self.lock:
             self.odom_err = max(self.odom_err, e)
@@ -376,6 +381,8 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--action", default="/m20/nlnav/navigate",
                     help="NavigateNL action to drive: /m20/nlnav/navigate (offline) or /m20/vlmnav/navigate (Real-time B)")
+    ap.add_argument("--truth-topic", default="/odom_true", help="/odom_true (sim) or /m20/vendor_pose (the robot's own report)")
+    ap.add_argument("--no-reset", action="store_true", help="no sim to teleport: the operator places the robot; start_pose is only logged")
     a = ap.parse_args()
     spec = yaml.safe_load(open(a.cases))
     start = spec.get("start_pose", [0, 0, 0])
@@ -392,7 +399,9 @@ def main():
             objects[int(o["id"])] = (o["xyz"][0], o["xyz"][1])
 
     rclpy.init()
-    node = Eval(a.action)
+    node = Eval(a.action, a.truth_topic)
+    # the robot (--no-reset): no sim API, nobody to teleport; "reset" = wait a second and have a pose
+    reset = (lambda node, start: (node.spin_for(1.0), node.xy() is not None)[1]) if a.no_reset else reset_robot
     if waypoints:
         if not node.mission.wait_for_server(timeout_sec=15):
             print("ERROR: mission server /m20/mission/run not available"); sys.exit(1)
@@ -400,9 +409,9 @@ def main():
         print(f"ERROR: action {a.action} not available"); sys.exit(1)
     node.spin_for(1.0)
     run = {"tag": a.tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "drive": a.drive, "config": json.loads(a.config),
-           "start_pose": start, "action": a.action, "cases": []}
+           "start_pose": start, "action": a.action, "truth_topic": a.truth_topic, "cases": []}
     print(f"[eval] {len(cases)} {'drive' if a.drive else 'plan'}-level cases x{a.repeat}; resetting the robot to the spawn")
-    if not reset_robot(node, start):
+    if not reset(node, start):
         print(f"[eval] WARNING: the robot did not reach the start pose {start[:2]}; plan cases depend on it")
     if a.drive:
         armed = node.arm()
@@ -416,7 +425,7 @@ def main():
             rec["known_issue"] = c["known_issue"]
         for k in range(a.repeat):
             att = {"t_start": time.time()}           # wall clock on purpose: joined to the node's log stamps
-            if a.drive and not reset_robot(node, start):
+            if a.drive and not reset(node, start):
                 att.update(failed_attempt("reset_failed", f"robot did not reach the start pose {start[:2]}"))
             elif a.drive:
                 node.spin_for(0.5)

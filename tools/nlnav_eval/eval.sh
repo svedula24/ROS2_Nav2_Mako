@@ -3,6 +3,7 @@
 #   bash tools/nlnav_eval/eval.sh [--tag NAME] [--repeat N] [--model qwen2.5:3b-instruct] [--drive] [--only a,b]
 #                                 [--action /m20/vlmnav/navigate --cases tools/realtime_b/cases.yaml]
 #                                 [--action /m20/vlfm/navigate --cases tools/realtime_b/cases_search.yaml]
+#                                 [--robot]   on Dog1: truth = /m20/vendor_pose (the robot's own report), no sim reset
 # --model restarts the NL container on that Ollama model (tools/godot/nlnav_up.sh) and waits for its warm-up.
 # --drive runs the drive-level cases (moves the robot; ~1 min per case) instead of the plan-level ones.
 # --action / --cases: Real-time B (tools/realtime_b/realtime_b_up.sh up): the same harness drives the VLM episodes.
@@ -11,7 +12,7 @@ set -eo pipefail               # a failure inside a pipe (docker exec | ...) mus
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 C=docker-commander-1
 SRC='source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp'
-TAG=run; REPEAT=1; MODEL=""; DRIVE=""; ONLY=""; SITE=circuit4; ACTION=/m20/nlnav/navigate; CASES=""
+TAG=run; REPEAT=1; MODEL=""; DRIVE=""; ONLY=""; SITE=circuit4; ACTION=/m20/nlnav/navigate; CASES=""; ROBOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="$2"; shift ;;
@@ -22,6 +23,7 @@ while [ $# -gt 0 ]; do
     --site) SITE="$2"; shift ;;
     --action) ACTION="$2"; shift ;;
     --cases) CASES="$2"; shift ;;
+    --robot) ROBOT="--truth-topic /m20/vendor_pose --no-reset" ;;   # on Dog1: truth = the robot's own report, nobody teleports it
     *) echo "unknown option $1"; exit 2 ;;
   esac
   shift
@@ -91,7 +93,7 @@ docker cp "$CASES" $C:/tmp/nlnav_eval/cases.yaml
 [ -f "$OBJECT_MAP" ] && docker cp "$OBJECT_MAP" $C:/tmp/nlnav_eval/object_map.json
 T0=$(date +%s)
 docker exec -i $C bash -lc "$SRC; python3 /tmp/nlnav_eval/run_eval.py --cases /tmp/nlnav_eval/cases.yaml --out /tmp/nlnav_eval/run.json \
-  --repeat $REPEAT --tag '$TAG' --config '$CFG' --object-map /tmp/nlnav_eval/object_map.json --action '$ACTION' $DRIVE ${ONLY:+--only $ONLY}"
+  --repeat $REPEAT --tag '$TAG' --config '$CFG' --object-map /tmp/nlnav_eval/object_map.json --action '$ACTION' $DRIVE $ROBOT ${ONLY:+--only $ONLY}"
 docker cp $C:/tmp/nlnav_eval/run.json "$OUT"
 if [ "$WAYPOINTS" = "1" ]; then : > "$OUT_DIR/${TAG}_${TS}.timing.log"; else
 docker logs --since "$T0" m20_nlnav 2>&1 | grep "timing:" > "$OUT_DIR/${TAG}_${TS}.timing.log" || true; fi
