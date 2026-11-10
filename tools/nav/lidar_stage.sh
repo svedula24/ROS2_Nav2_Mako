@@ -8,30 +8,35 @@
 #   bash lidar_stage.sh <container> [--tf]      start the converters in <container>; --tf also publishes the two
 #                                               static mount transforms (the robot: no sim bridge publishes them)
 #   bash lidar_stage.sh <container> --check     fail unless both clouds AND both scans arrive within 10 s
+#   bash lidar_stage.sh <container> --check-scans   the scans only (what crosses from the robot's lidar container
+#                                               to the Nav2 container; the clouds stay inside the former)
 #
 # Mount numbers (--tf) = the robot's URDF, measured 2026-10-16: front (+0.32028, 0, -0.013) rpy (0, -1.57079, -3.14159),
 # rear (-0.32028, 0, -0.013) rpy (0, -1.57079, 0): both units hang pitched -90 deg under the body and look DOWN/outward.
 set -euo pipefail
 C="${1:?usage: lidar_stage.sh <container> [--tf | --check]}"; shift
 MODE="${1:-start}"
-SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42} RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+# RMW_IMPLEMENTATION: the stack's Cyclone by default; the robot's lidar container runs Fast DDS with shared memory for
+# the big clouds (tools/lidar/lidar_up.sh) and sets it accordingly
+SRC="source /opt/ros/humble/setup.bash; source /ws/install/setup.bash; export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 docker exec "$C" test -f /cfg/pointcloud_to_laserscan.yaml || { echo "lidar_stage: /cfg/pointcloud_to_laserscan.yaml not staged in $C"; exit 1; }
 
-if [ "$MODE" = "--check" ]; then
+if [ "$MODE" = "--check" ] || [ "$MODE" = "--check-scans" ]; then
   # read ROS state with rclpy, not the ros2 CLI daemon (it wedges in the commander container)
-  docker exec -i "$C" bash -lc "$SRC; timeout 20 python3 -" <<'PY'
-import sys, time, rclpy
+  docker exec -i -e WANT="$([ "$MODE" = "--check" ] && echo clouds+scans || echo scans)" "$C" bash -lc "$SRC; timeout 20 python3 -" <<'PY'
+import os, sys, time, rclpy
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan, PointCloud2
+want = ["scan_front", "scan_rear"] + (["cloud_front", "cloud_rear"] if os.environ["WANT"] == "clouds+scans" else [])
 rclpy.init(); n = rclpy.create_node("lidar_stage_check"); got = {}
 for side in ("front", "rear"):
     n.create_subscription(PointCloud2, f"/rslidar_points_{side}", (lambda s: lambda m: got.__setitem__(f"cloud_{s}", m.width))(side), qos_profile_sensor_data)
     n.create_subscription(LaserScan, f"/scan_{side}", (lambda s: lambda m: got.__setitem__(f"scan_{s}", sum(1 for r in m.ranges if r == r and r < m.range_max)))(side), qos_profile_sensor_data)
 t = time.monotonic()
-while len(got) < 4 and time.monotonic() - t < 10:
+while not all(k in got for k in want) and time.monotonic() - t < 10:
     rclpy.spin_once(n, timeout_sec=0.2)
 print("  lidar stage:", ", ".join(f"{k} {v}" for k, v in sorted(got.items())) or "nothing")
-missing = [k for k in ("cloud_front", "cloud_rear", "scan_front", "scan_rear") if k not in got]
+missing = [k for k in want if k not in got]
 if missing:
     print("  lidar stage: MISSING", " ".join(missing)); sys.exit(1)
 PY
