@@ -7,7 +7,10 @@ import types
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools", "nav"))
-sys.modules.setdefault("tf2_ros", types.SimpleNamespace(Buffer=object, TransformBroadcaster=object, TransformListener=object))
+try:
+    import tf2_ros  # noqa: F401  (a repo may ship a tests/shims/tf2_ros; a bare stub must not shadow it)
+except ImportError:
+    sys.modules["tf2_ros"] = types.SimpleNamespace(Buffer=object, TransformBroadcaster=object, TransformListener=object)
 sys.modules.setdefault("rclpy.time", types.SimpleNamespace(Time=object))
 sys.modules.setdefault("rclpy.duration", types.SimpleNamespace(Duration=object))
 import map_tf_adapter as a   # noqa: E402
